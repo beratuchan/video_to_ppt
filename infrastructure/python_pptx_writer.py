@@ -98,3 +98,23 @@ class PythonPPTXWriter(IPPTXWriter):
 
     def close(self):
         pass
+
+    def replace_slide_with_image(self, slide_index: int, image_path: str, left_inch=1, top_inch=1, width_inch=8, height_inch=6) -> None:
+        """
+        Belirtilen slayttaki tüm şekilleri siler ve verilen resmi (GIF/PNG/JPG) ekler.
+        """
+        from pptx.util import Inches
+        prs = self._new_prs if self._new_prs else Presentation(self.source_path)
+        slide = prs.slides[slide_index]
+        # Mevcut şekilleri temizle
+        for shape in list(slide.shapes):
+            sp = shape.element
+            sp.getparent().remove(sp)
+        # Yeni resmi ekle
+        left = Inches(left_inch)
+        top = Inches(top_inch)
+        width = Inches(width_inch)
+        height = Inches(height_inch)
+        with open(image_path, 'rb') as f:
+            slide.shapes.add_picture(f, left, top, width, height)
+        self._new_prs = prs

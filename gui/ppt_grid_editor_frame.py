@@ -61,6 +61,8 @@ class PPTGridEditorFrame(ttk.Frame):
         self.btn_grid.pack(side=tk.LEFT, padx=10)
         self.btn_upgrade = ttk.Button(btn_frame, text="Seçili Slaytları Yüksek Kaliteye Yükselt", command=self.upgrade_selected)
         self.btn_upgrade.pack(side=tk.LEFT, padx=10)
+        self.btn_gif = ttk.Button(btn_frame, text="Seçili Slaytları GIF Animasyonu Yap", command=self.gif_selected)
+        self.btn_gif.pack(side=tk.LEFT, padx=10)
         self._disable_buttons()
 
         frame_canvas = ttk.Frame(self)
@@ -128,11 +130,13 @@ class PPTGridEditorFrame(ttk.Frame):
         self.btn_delete.config(state=tk.DISABLED)
         self.btn_grid.config(state=tk.DISABLED)
         self.btn_upgrade.config(state=tk.DISABLED)
+        self.btn_gif.config(state=tk.DISABLED)
 
     def _enable_buttons(self):
         self.btn_delete.config(state=tk.NORMAL)
         self.btn_grid.config(state=tk.NORMAL)
         self.btn_upgrade.config(state=tk.NORMAL)
+        self.btn_gif.config(state=tk.NORMAL)
 
     def on_file_selected(self, event=None):
         selection = self.file_combo.current()
@@ -270,6 +274,7 @@ class PPTGridEditorFrame(ttk.Frame):
         self.btn_upgrade.config(state=tk.DISABLED)
         self.btn_grid.config(state=tk.DISABLED)
         self.btn_delete.config(state=tk.DISABLED)
+        self.btn_gif.config(state=tk.DISABLED)
 
         total = len(self.selected_indices)
         self.status_label.config(text=f"Yüksek kaliteli kareler alınıyor (0/{total})...")
@@ -303,6 +308,27 @@ class PPTGridEditorFrame(ttk.Frame):
         messagebox.showerror("Hata", f"Yükseltme sırasında hata:\n{error_msg}")
         self.status_label.config(text="Hata oluştu")
         self._enable_buttons()
+
+    def gif_selected(self):
+        if len(self.selected_indices) < 2:
+            messagebox.showerror("Hata", "En az iki slayt seçmelisiniz")
+            return
+        try:
+            self.status_label.config(text="GIF animasyonu oluşturuluyor...")
+            self.update_idletasks()
+            self._disable_buttons()
+            self.controller.replace_slides_with_gif(self.selected_indices, duration_per_frame=0.5)
+            self.controller.save(self.current_pptx_path)
+            self.status_label.config(text="GIF slayt oluşturuldu.")
+            self.refresh_slides()
+            self._enable_buttons()
+            messagebox.showinfo("Tamamlandı", 
+                "GIF animasyonu başarıyla slayta eklendi.\n\n"
+                "Slayt gösterisi başladığında GIF otomatik olarak dönecektir.\n"
+                "Not: PowerPoint'te GIF'in döngüye girmesi için herhangi bir ek ayar gerekmez.")
+        except Exception as e:
+            messagebox.showerror("Hata", str(e))
+            self._enable_buttons()
 
     def set_pptx_and_video(self, pptx_path, video_path):
         self.temp_video_path = video_path
