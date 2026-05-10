@@ -81,7 +81,6 @@ class PPTGridEditorFrame(ttk.Frame):
         self.status_label = ttk.Label(self, text="", anchor="w")
         self.status_label.pack(fill=tk.X, padx=10, pady=5)
 
-    # ---- Dosya ve klasör işlemleri ---- #
     def load_last_working_directory(self):
         try:
             with open(self.settings_file, "r") as f:
@@ -125,7 +124,6 @@ class PPTGridEditorFrame(ttk.Frame):
             self.status_label.config(text="Klasörde PowerPoint dosyası bulunamadı")
             self._disable_buttons()
 
-    # ---- UI Durum Yönetimi ---- #
     def _disable_buttons(self):
         self.btn_delete.config(state=tk.DISABLED)
         self.btn_grid.config(state=tk.DISABLED)
@@ -157,7 +155,6 @@ class PPTGridEditorFrame(ttk.Frame):
             messagebox.showerror("Hata", f"Dosya açılamadı: {e}")
             self._disable_buttons()
 
-    # ---- Slayt Listesi Oluşturma ve Seçim ---- #
     def refresh_slides(self):
         for widget in self.inner.winfo_children():
             widget.destroy()
@@ -195,22 +192,22 @@ class PPTGridEditorFrame(ttk.Frame):
             lbl_num = tk.Label(slide_frame, text=f"Slayt {idx+1}", font=("Arial", 10, "bold"), bg='white')
             lbl_num.pack()
             var = tk.BooleanVar()
-            # Checkbutton'ın command'ı sadece tıklama ile değil, programatik değişimde de çalışır.
-            # Ancak _select_single ile var.set yapıldığında tetiklenmemesi için command kullanmıyoruz.
-            # Sadece variable'ı kullanıyoruz, command yok.
-            cb = ttk.Checkbutton(slide_frame, variable=var, text="Seç")
+            cb = ttk.Checkbutton(slide_frame, variable=var, text="Seç", command=lambda i=idx: self._on_checkbutton_click(i))
             cb.pack()
             self.thumbnails.append((photo, var, idx))
 
         self.inner.update_idletasks()
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
+    def _on_checkbutton_click(self, idx):
+        if idx in self.selected_indices:
+            self._select_single(idx, False)
+        else:
+            self._select_single(idx, True)
+        self.last_clicked_index = idx
+
     def _on_slide_click(self, event, idx):
-        # Shift tuşunun basılı olup olmadığını event.state'den kontrol et (Windows/Linux)
-        # Shift maskesi 0x0001'dir. Bazı durumlarda NumLock vs. eklenebilir, o yüzden & ile kontrol.
         shift_pressed = (event.state & 0x0001) != 0
-        # Debug için yazdır (istenirse kaldır)
-        # print(f"Click idx={idx}, shift={shift_pressed}, last={self.last_clicked_index}")
         if shift_pressed and self.last_clicked_index is not None:
             start = min(self.last_clicked_index, idx)
             end = max(self.last_clicked_index, idx)
@@ -219,7 +216,6 @@ class PPTGridEditorFrame(ttk.Frame):
                     self._select_single(i, True)
             self.last_clicked_index = idx
         else:
-            # Normal tıklama: seçiliyse kaldır, değilse seç
             if idx in self.selected_indices:
                 self._select_single(idx, False)
             else:
@@ -237,7 +233,6 @@ class PPTGridEditorFrame(ttk.Frame):
             var = self.thumbnails[idx][1]
             var.set(select)
 
-    # ---- Ana İşlemler (Sil, Grid Birleştir, Kalite Yükselt) ---- #
     def delete_selected(self):
         if not self.selected_indices:
             messagebox.showerror("Hata", "Silinecek slayt seçin")
