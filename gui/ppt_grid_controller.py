@@ -1,0 +1,94 @@
+from typing import List, Optional, Callable
+from PIL import Image
+from domain.i_pptx_reader import IPPTXReader
+from domain.i_pptx_writer import IPPTXWriter
+from domain.i_grid_composer import IGridComposer
+from utils.grid_utils import calculate_grid_dimensions
+from infrastructure.high_res_frame_extractor import HighResFrameExtractor
+from utils.url_resolver import resolve_video_url
+import re
+import cv2
+import numpy as np
+
+class PPTGridController:
+    def __init__(self, reader: IPPTXReader, writer: IPPTXWriter, composer: IGridComposer):
+        self.reader = reader
+        self.writer = writer
+        self.composer = composer
+
+    def get_slide_count(self) -> int:
+        return self.reader.get_slide_count()
+
+    def get_slide_preview(self, index: int, max_size: int = 100) -> Optional[Image.Image]:
+        return self.reader.get_first_image_thumbnail(index, max_size)
+
+    def delete_slides(self, selected_indices: List[int]) -> None:
+        if not selected_indices:
+            raise ValueError("Silinecek slayt seçilmedi")
+        self.writer.delete_slides(selected_indices)
+        self.reader.update_from_writer(self.writer)
+
+    def apply_grid(self, selected_indices: List[int], margin: int = 10) -> None:
+        if len(selected_indices) < 2:
+            raise ValueError("En az iki slayt seçmelisiniz")
+        images = []
+        for idx in selected_indices:
+            imgs = self.reader.get_slide_images(idx)
+            images.extend(imgs)
+        if not images:
+            raise ValueError("Seçilen slaytlarda hiç resim bulunamadı")
+        rows, cols = calculate_grid_dimensions(len(images))
+        grid_image = self.composer.compose(images, rows, cols, margin)
+        self.writer.rebuild_with_grid(selected_indices, grid_image)
+        self.reader.update_from_writer(self.writer)
+
+    def save(self, path: str) -> None:
+        self.writer.save(path)
+
+    def close(self):
+        self.reader.close()
+        self.writer.close()
+
+    def upgrade_slides(self, selected_indices: List[int], target_width: int = 1920, progress_callback: Optional[Callable[[int, int, int], None]] = None) -> None:
+        if not selected_indices:
+            raise ValueError("Yükseltilecek slayt seçilmedi")
+
+        first_slide_text = self.reader.get_slide_text(0)
+        youtube_url = self._extract_url_from_text(first_slide_text)
+        if not youtube_url:
+            raise ValueError("İlk slaytta video URL'si bulunamadı")
+
+        video_stream_url = resolve_video_url(youtube_url)
+        if not video_stream_url:
+            raise ValueError("Video akış URL'si alınamadı")
+
+        extractor = HighResFrameExtractor(video_stream_url)
+        total = len(selected_indices)
+        for i, idx in enumerate(selected_indices):
+            if progress_callback:
+                progress_callback(i, total, idx)
+            slide_text = self.reader.get_slide_text(idx)
+            seconds = self._extract_timestamp_from_text(slide_text)
+            if seconds is None:
+                continue
+            high_res_bgr = extractor.extract_frame(seconds, target_width=target_width)
+            if high_res_bgr is None:
+                continue
+            # numpy BGR'yi PIL RGB'ye çevir
+            high_res_rgb = cv2.cvtColor(high_res_bgr, cv2.COLOR_BGR2RGB)
+            high_res_pil = Image.fromarray(high_res_rgb)
+            self.writer.replace_slide_image(idx, high_res_pil)
+        self.reader.update_from_writer(self.writer)
+
+    def _extract_url_from_text(self, text: str) -> Optional[str]:
+        match = re.search(r'Video URL:\s*(https?://[^\s]+)', text)
+        return match.group(1) if match else None
+
+    def _extract_timestamp_from_text(self, text: str) -> Optional[float]:
+        match = re.search(r'(\d{2}):(\d{2}):(\d{3})', text)
+        if match:
+            minutes = int(match.group(1))
+            seconds = int(match.group(2))
+            ms = int(match.group(3))
+            return minutes * 60 + seconds + ms / 1000.0
+        return None

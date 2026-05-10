@@ -1,0 +1,5091 @@
+
+
+// === C://Users//BERAT//Desktop//video_to_ppt\main.py ===
+
+
+from gui.main_window import MainWindow
+
+if __name__ == "__main__":
+    app = MainWindow()
+    app.mainloop()
+
+// === C://Users//BERAT//Desktop//video_to_ppt\config\di_container.py ===
+
+from infrastructure.video_downloader import VideoDownloader
+from infrastructure.local_video_stream import LocalVideoStream
+from infrastructure.pptx_slide_builder import PptxSlideBuilder
+from core.slideshow_generator import SlideshowGenerator
+from domain.i_progress_observer import IProgressObserver
+from strategies.frame_sampling.time_based_sampler import TimeBasedSampler
+from strategies.scene_detection.robust_diff_strategy import RobustDiffStrategy
+from config.settings import *
+import os
+from typing import Optional
+
+def create_generator_for_url(
+    url: str,
+    output_dir: str = ".",
+    observer: Optional[IProgressObserver] = None
+) -> SlideshowGenerator:
+    downloader = VideoDownloader()
+    try:
+        video_path = downloader.download(url)
+    except Exception as e:
+        if observer:
+            observer.on_error(url, str(e))
+        raise
+
+    title = url.split('v=')[-1][:20] if 'v=' in url else 'video'
+    video_stream = LocalVideoStream(video_path, target_fps=DEFAULT_FPS, target_width=DEFAULT_TARGET_WIDTH)
+    scene_detector = RobustDiffStrategy(
+        hist_threshold=DEFAULT_HIST_THRESHOLD,
+        pixel_threshold=DEFAULT_PIXEL_THRESHOLD,
+    )
+    output_path = os.path.join(output_dir, f"{title}.pptx")
+    slide_builder = PptxSlideBuilder(output_path, video_title=title, video_url=url)
+    frame_sampler = TimeBasedSampler(interval_sec=1.0)
+    
+    generator = SlideshowGenerator(
+        video_stream,
+        scene_detector,
+        slide_builder,
+        observer=observer,
+        min_slide_interval=MIN_SLIDE_INTERVAL_SEC,
+        frame_sampler=frame_sampler,
+        frame_queue_size=30,
+        add_first_slide_with_link=True,
+        temp_video_path=video_path,
+        downloader=downloader
+    )
+    return generator
+
+// === C://Users//BERAT//Desktop//video_to_ppt\config\settings.py ===
+
+"""
+Uygulama genelinde kullanılan sabitler ve yapılandırma değerleri.
+"""
+
+# Video işleme ayarları
+DEFAULT_FPS = 1                     # Saniyede 1 kare (çok hızlı)
+DEFAULT_TARGET_WIDTH = 640          # Daha küçük çözünürlük (hız ve bellek için)
+DEFAULT_IMAGE_QUALITY = 85
+MIN_SLIDE_INTERVAL_SEC = 0.5        # Minimum slayt aralığını biraz artır (gereksiz slaytları engeller)
+
+# Sahne tespiti varsayılanları (RobustDiffStrategy)
+DEFAULT_HIST_THRESHOLD = 0.999      # Histogram kullanmıyorsan değer önemsiz
+DEFAULT_PIXEL_THRESHOLD = 0.02      # Piksel farkı hassasiyeti (0.01 çok hassas, 0.03 daha az)
+DEFAULT_USE_HISTOGRAM = False       # Sadece piksel farkı kullan (daha hızlı)
+
+# AbsDiffStrategy için varsayılan
+DEFAULT_ABS_DIFF_THRESHOLD = 0.05
+
+# PPTX slayt düzeni sabitleri (inç cinsinden)
+SLIDE_IMAGE_LEFT_INCH = 1.0
+SLIDE_IMAGE_TOP_INCH = 1.5
+SLIDE_TEXT_LEFT_INCH = 1.0
+SLIDE_TEXT_TOP_INCH = 6.5
+SLIDE_TEXT_WIDTH_INCH = 8.0
+SLIDE_TEXT_HEIGHT_INCH = 1.0
+SLIDE_FONT_SIZE_TIMESTAMP = 14
+SLIDE_FONT_SIZE_TEXT = 18
+
+# Görüntü işleme
+JPEG_QUALITY = 85
+RESAMPLE_FILTER = "LANCZOS"  # PIL Resampling filter
+DPI = 96  # Varsayılan DPI (inç başına piksel)
+
+# FFmpeg
+FFMPEG_BUFFER_SIZE = 10 ** 8
+FFMPEG_LOGLEVEL = "error"
+
+# Yt-dlp
+YTDL_OPTS = {
+    'quiet': True,
+    'no_warnings': True,
+    'extract_flat': False,
+    'forcejson': True,
+    'compat_opts': ['ejs'],
+    'noplaylist': True,
+}
+
+// === C://Users//BERAT//Desktop//video_to_ppt\config\__init__.py ===
+
+
+
+
+// === C://Users//BERAT//Desktop//video_to_ppt\core\progress_notifier.py ===
+
+import queue
+from typing import Optional
+from domain.i_progress_observer import IProgressObserver
+
+class ProgressNotifier(IProgressObserver):
+    """Mesajları doğrudan verilen kuyruğa yazar."""
+
+    def __init__(self, target_queue: queue.Queue):
+        self._queue = target_queue
+
+    def on_progress(self, percent: float, message: str):
+        self._queue.put(('progress', percent, message))
+
+    def on_error(self, url: str, error_msg: str):
+        self._queue.put(('error', url, error_msg))
+
+    def on_finished(self, success_count: int, total_count: int):
+        self._queue.put(('finished', success_count, total_count))
+
+// === C://Users//BERAT//Desktop//video_to_ppt\core\slideshow_generator.py ===
+
+import time
+from typing import Optional
+from domain.i_video_stream import IVideoStream
+from domain.i_scene_detector import ISceneDetector
+from domain.i_slide_builder import ISlideBuilder
+from domain.i_progress_observer import IProgressObserver
+from domain.i_frame_sampler import IFrameSampler
+from strategies.frame_sampling.every_frame_sampler import EveryFrameSampler
+from config.settings import MIN_SLIDE_INTERVAL_SEC
+
+class SlideshowGenerator:
+    def __init__(
+        self,
+        video_stream: IVideoStream,
+        scene_detector: ISceneDetector,
+        slide_builder: ISlideBuilder,
+        observer: Optional[IProgressObserver] = None,
+        min_slide_interval: float = MIN_SLIDE_INTERVAL_SEC,
+        frame_sampler: Optional[IFrameSampler] = None,
+        frame_queue_size: int = 30,
+        add_first_slide_with_link: bool = False,
+        temp_video_path: str = None,
+        downloader=None
+    ):
+        self.video_stream = video_stream
+        self.scene_detector = scene_detector
+        self.slide_builder = slide_builder
+        self.observer = observer
+        self.min_slide_interval = min_slide_interval
+        self.frame_sampler = frame_sampler if frame_sampler else EveryFrameSampler()
+        self.add_first_slide_with_link = add_first_slide_with_link
+        self.temp_video_path = temp_video_path
+        self.downloader = downloader
+
+    def generate_slideshow(self) -> str:
+        video_info = self.video_stream.get_info()
+        duration = video_info.get('duration_seconds', 0)
+        title = video_info.get('title', 'Video')
+        fps = video_info.get('fps', 1)
+
+        self.frame_sampler.reset()
+        self._notify(0, "Video işleniyor...")
+
+        if self.add_first_slide_with_link:
+            self.slide_builder.create_new_slide()
+            video_url = getattr(self.video_stream, 'url', 'Bilinmiyor')
+            self.slide_builder.add_text(f"Video URL: {video_url}", font_size=18, bold=False)
+            self.slide_builder.add_timestamp(0, title)
+
+        prev_frame = None
+        frame_index = 0
+        scene_count = 0
+        last_slide_time = -self.min_slide_interval
+        start_time = time.time()
+
+        while True:
+            frame = self.video_stream.get_frame()
+            if frame is None:
+                break
+
+            current_sec = frame_index / fps
+            if self.frame_sampler.should_sample(frame_index, frame, current_sec):
+                if self.scene_detector.is_scene_change(prev_frame, frame):
+                    if (current_sec - last_slide_time) >= self.min_slide_interval:
+                        self.slide_builder.create_new_slide()
+                        self.slide_builder.add_image(frame)
+                        self.slide_builder.add_timestamp(current_sec, title)
+                        scene_count += 1
+                        last_slide_time = current_sec
+                prev_frame = frame
+
+            frame_index += 1
+            if frame_index % 30 == 0 and duration > 0:
+                percent = min(100.0, (frame_index / (duration * fps)) * 100.0)
+                self._notify(percent, f"İşleniyor... ({scene_count} slayt)")
+
+        elapsed = time.time() - start_time
+        self._notify(100, f"Tamamlandı! {scene_count} slayt, {elapsed:.1f} saniye")
+        return self.slide_builder.build()
+
+    def _notify(self, percent: float, message: str) -> None:
+        if self.observer:
+            self.observer.on_progress(percent, message)
+
+// === C://Users//BERAT//Desktop//video_to_ppt\core\__init__.py ===
+
+
+
+
+// === C://Users//BERAT//Desktop//video_to_ppt\domain\i_frame_sampler.py ===
+
+from abc import ABC, abstractmethod
+from typing import Optional
+import numpy as np
+
+class IFrameSampler(ABC):
+    """
+    Video akışından hangi frame'lerin işleneceğine karar veren strateji.
+    """
+    @abstractmethod
+    def should_sample(self, frame_index: int, frame: Optional[np.ndarray], current_time: float) -> bool:
+        """
+        Belirtilen frame'in işlenmesi gerekip gerekmediğini döndürür.
+        - frame_index: kaçıncı frame (0'dan başlar)
+        - frame: frame verisi (None olabilir)
+        - current_time: videoda geçen saniye
+        """
+        pass
+
+    @abstractmethod
+    def reset(self) -> None:
+        """Yeni video başlangıcında sıfırlama."""
+        pass
+
+// === C://Users//BERAT//Desktop//video_to_ppt\domain\i_grid_composer.py ===
+
+from abc import ABC, abstractmethod
+from typing import List
+from PIL import Image
+
+class IGridComposer(ABC):
+    @abstractmethod
+    def compose(self, images: List[Image.Image], rows: int, cols: int, margin: int = 10) -> Image.Image:
+        pass
+
+// === C://Users//BERAT//Desktop//video_to_ppt\domain\i_pptx_appender.py ===
+
+from abc import ABC, abstractmethod
+from PIL import Image
+
+class IPPTXAppender(ABC):
+    @abstractmethod
+    def append_image_as_slide(self, image: Image.Image, title: str = "Grid Slayt") -> str:
+        """Birleştirilmiş görseli yeni bir PPTX slaytı olarak ekler, dosya yolunu döndürür."""
+        pass
+
+// === C://Users//BERAT//Desktop//video_to_ppt\domain\i_pptx_reader.py ===
+
+from abc import ABC, abstractmethod
+from typing import List, Optional
+from PIL import Image
+
+class IPPTXReader(ABC):
+    @abstractmethod
+    def get_slide_count(self) -> int:
+        pass
+
+    @abstractmethod
+    def get_slide_images(self, slide_index: int) -> List[Image.Image]:
+        pass
+
+    @abstractmethod
+    def get_slide_text(self, slide_index: int) -> str:
+        """Slayttaki tüm metinleri döndürür (altbilgi dahil)."""
+        pass
+
+    @abstractmethod
+    def get_first_image_thumbnail(self, slide_index: int, max_size: int = 100) -> Optional[Image.Image]:
+        pass
+
+    @abstractmethod
+    def update_from_writer(self, writer) -> None:
+        pass
+
+    @abstractmethod
+    def close(self):
+        pass
+
+// === C://Users//BERAT//Desktop//video_to_ppt\domain\i_pptx_writer.py ===
+
+from abc import ABC, abstractmethod
+from typing import List
+from PIL import Image
+
+class IPPTXWriter(ABC):
+    @abstractmethod
+    def delete_slides(self, indices: List[int]) -> None:
+        pass
+
+    @abstractmethod
+    def rebuild_with_grid(self, selected_indices: List[int], grid_image: Image.Image) -> None:
+        pass
+
+    @abstractmethod
+    def replace_slide_image(self, slide_index: int, new_image: Image.Image) -> None:
+        """Belirtilen slayttaki ilk resmi yenisiyle değiştirir."""
+        pass
+
+    @abstractmethod
+    def save(self, path: str) -> None:
+        pass
+
+    @abstractmethod
+    def close(self):
+        pass
+
+// === C://Users//BERAT//Desktop//video_to_ppt\domain\i_progress_observer.py ===
+
+
+from abc import ABC, abstractmethod
+
+class IProgressObserver(ABC):
+    """GUI'ye ilerleme bildirimi yapmak için Observer arayüzü."""
+
+    @abstractmethod
+    def on_progress(self, percent: float, message: str) -> None:
+        """
+        percent: 0-100 arası ilerleme yüzdesi
+        message: Kullanıcıya gösterilecek bilgi metni (örn: "Sahne tespit ediliyor...")
+        """
+        pass
+
+    @abstractmethod
+    def on_error(self, url: str, error_msg: str) -> None:
+        """Bir URL işlenirken hata oluştuğunda çağrılır (çoklu URL senaryosu)."""
+        pass
+
+    @abstractmethod
+    def on_finished(self, success_count: int, total_count: int) -> None:
+        """Tüm işlemler bittiğinde çağrılır."""
+        pass
+
+// === C://Users//BERAT//Desktop//video_to_ppt\domain\i_scene_detector.py ===
+
+from abc import ABC, abstractmethod
+from typing import List, Optional
+import numpy as np
+
+class ISceneDetector(ABC):
+    """Sahne geçişi tespit stratejileri için arayüz."""
+
+    @abstractmethod
+    def is_scene_change(self, prev_frame: Optional[np.ndarray], curr_frame: np.ndarray) -> bool:
+        """
+        İki frame arasında anlamlı bir sahne değişimi olup olmadığını döndürür.
+        prev_frame = None ise ilk frame olarak kabul edilir (genellikle True döndürülür).
+        """
+        pass
+
+    @abstractmethod
+    def set_threshold(self, value: float) -> None:
+        """Duyarlılık eşik değerini ayarlar (0-1 arası, varsayılan 0.3 gibi)."""
+        pass
+
+// === C://Users//BERAT//Desktop//video_to_ppt\domain\i_slide_builder.py ===
+
+from abc import ABC, abstractmethod
+from typing import Any, Optional
+import numpy as np
+
+class ISlideBuilder(ABC):
+    @abstractmethod
+    def create_new_slide(self) -> None:
+        pass
+
+    @abstractmethod
+    def add_image(self, image: np.ndarray, max_width: int = 1024, quality: int = 85) -> None:
+        pass
+
+    @abstractmethod
+    def add_text(self, text: str, font_size: int = 18, bold: bool = False) -> None:
+        pass
+
+    @abstractmethod
+    def add_timestamp(self, seconds: float, video_title: str = "") -> None:
+        pass
+
+    @abstractmethod
+    def build(self) -> Any:
+        pass
+
+// === C://Users//BERAT//Desktop//video_to_ppt\domain\i_subtitle_provider.py ===
+
+from abc import ABC, abstractmethod
+from typing import List, Dict, Optional
+
+class ISubtitleProvider(ABC):
+    """
+    Altyazı sağlayıcısı arayüzü.
+    Bu sürümde kullanılmayacak, ancak Open/Closed prensibi gereği hazır tutulmaktadır.
+    Gelecekteki sürümlerde implemente edilebilir.
+    """
+
+    @abstractmethod
+    def fetch_subtitles(self, video_url: str, lang: str = "tr") -> Optional[List[Dict]]:
+        """
+        Video URL'sine ait altyazıları getirir.
+        Dönen liste: [{"start": float, "end": float, "text": str}, ...]
+        Başarısızsa None döner.
+        """
+        pass
+
+    @abstractmethod
+    def has_subtitles(self, video_url: str) -> bool:
+        """Videoda istenen dilde altyazı olup olmadığını kontrol eder."""
+        pass
+
+// === C://Users//BERAT//Desktop//video_to_ppt\domain\i_video_stream.py ===
+
+from abc import ABC, abstractmethod
+from typing import Optional, Dict
+import numpy as np
+
+class IVideoStream(ABC):
+    """Video akışından frame okuma ve meta bilgi alma arayüzü."""
+
+    @abstractmethod
+    def get_frame(self) -> Optional[np.ndarray]:
+        """
+        Bir sonraki frame'i (numpy array, BGR formatında) döndürür.
+        Akış sona erdiyse None döner.
+        """
+        pass
+
+    @abstractmethod
+    def get_info(self) -> Dict:
+        """
+        Video bilgilerini içeren sözlük döndürür.
+        Anahtarlar: 'title', 'duration_seconds', 'width', 'height', 'fps'
+        """
+        pass
+
+    @abstractmethod
+    def close(self) -> None:
+        """Akışla ilişkili kaynakları serbest bırakır."""
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+// === C://Users//BERAT//Desktop//video_to_ppt\domain\__init__.py ===
+
+# Domain katmanı soyutlamaları
+from .i_video_stream import IVideoStream
+from .i_scene_detector import ISceneDetector
+from .i_slide_builder import ISlideBuilder
+from .i_progress_observer import IProgressObserver
+from .i_subtitle_provider import ISubtitleProvider
+
+__all__ = [
+    "IVideoStream",
+    "ISceneDetector",
+    "ISlideBuilder",
+    "IProgressObserver",
+    "ISubtitleProvider",
+]
+
+// === C://Users//BERAT//Desktop//video_to_ppt\gui\conversion_controller.py ===
+
+import queue
+import threading
+from typing import List, Optional
+from core.slideshow_generator import SlideshowGenerator
+from core.progress_notifier import ProgressNotifier
+from config.di_container import create_generator_for_url
+
+class ConversionController:
+    def __init__(self, msg_queue: queue.Queue):
+        self.msg_queue = msg_queue
+        self.notifier = ProgressNotifier(msg_queue)
+        self._is_running = False
+        self._stop_requested = False
+        self._current_thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+
+    @property
+    def is_running(self) -> bool:
+        with self._lock:
+            return self._is_running
+
+    def start(self, url_list: List[str]) -> None:
+        with self._lock:
+            if self._is_running:
+                self.msg_queue.put(('error', None, "Zaten bir dönüştürme işlemi devam ediyor."))
+                return
+            if not url_list:
+                self.msg_queue.put(('error', None, "İşlenecek URL yok."))
+                return
+            self._is_running = True
+            self._stop_requested = False
+
+        self._current_thread = threading.Thread(
+            target=self._process_urls,
+            args=(url_list,),
+            daemon=True
+        )
+        self._current_thread.start()
+
+    def stop(self) -> None:
+        with self._lock:
+            self._stop_requested = True
+
+    def _process_urls(self, url_list: List[str]) -> None:
+        success_count = 0
+        errors = []
+        total = len(url_list)
+
+        for idx, url in enumerate(url_list):
+            with self._lock:
+                if self._stop_requested:
+                    self.msg_queue.put(('progress', 0, "İşlem kullanıcı tarafından durduruldu."))
+                    break
+
+            percent = int((idx / total) * 100)
+            self.msg_queue.put(('progress', percent, f"({idx+1}/{total}) İşleniyor: {url}"))
+
+            try:
+                generator = create_generator_for_url(url, observer=self.notifier)
+                pptx_path = generator.generate_slideshow()
+                self.msg_queue.put(('result', url, pptx_path))
+                self.msg_queue.put(('open_ppt_editor', pptx_path, generator.temp_video_path))
+                success_count += 1
+            except Exception as e:
+                error_msg = str(e)
+                self.msg_queue.put(('error', url, error_msg))
+                errors.append((url, error_msg))
+
+        with self._lock:
+            self._is_running = False
+
+        if errors and not self._stop_requested:
+            summary = f"{len(errors)} hata oluştu:\n" + "\n".join([f"{u}: {e}" for u, e in errors[:3]])
+            self.msg_queue.put(('messagebox', "Uyarı", summary))
+
+        self.msg_queue.put(('finished', success_count, total))
+
+// === C://Users//BERAT//Desktop//video_to_ppt\gui\main_window.py ===
+
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import queue
+from typing import List
+from gui.conversion_controller import ConversionController
+from gui.ppt_grid_editor_frame import PPTGridEditorFrame
+
+class MainWindow(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("YouTube2Slides - Video'dan Slayt ve PPT Düzenleme")
+        self.state('zoomed')
+        self.bind('<Escape>', lambda e: self._on_close())
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self.msg_queue = queue.Queue()
+        self.controller = ConversionController(self.msg_queue)
+
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+
+        self.conversion_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.conversion_tab, text="Video ➔ Slayt")
+
+        self.editor_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.editor_tab, text="PPT Düzenleme")
+        self.editor_frame = PPTGridEditorFrame(self.editor_tab, temp_video_path=None)
+        self.editor_frame.pack(fill=tk.BOTH, expand=True)
+
+        self._create_conversion_widgets()
+        self._poll_queue()
+
+    def _create_conversion_widgets(self):
+        tk.Label(self.conversion_tab, text="YouTube URL (tek veya satır satır):").pack(pady=5)
+        self.url_text = tk.Text(self.conversion_tab, height=8)
+        self.url_text.pack(fill=tk.BOTH, padx=10, pady=5, expand=True)
+
+        btn_frame = tk.Frame(self.conversion_tab)
+        btn_frame.pack(pady=5)
+        tk.Button(btn_frame, text="Listeyi Temizle", command=self._clear_urls).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="Dönüştürmeyi Başlat", command=self._start_conversion).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="Durdur", command=self._stop_conversion).pack(side=tk.LEFT, padx=5)
+
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(self.conversion_tab, variable=self.progress_var, maximum=100)
+        self.progress_bar.pack(fill=tk.X, padx=10, pady=10)
+
+        self.status_label = tk.Label(self.conversion_tab, text="Hazır", anchor="w")
+        self.status_label.pack(fill=tk.X, padx=10)
+
+        self.result_listbox = tk.Listbox(self.conversion_tab, height=8)
+        self.result_listbox.pack(fill=tk.BOTH, padx=10, pady=5, expand=True)
+
+    def _clear_urls(self):
+        self.url_text.delete(1.0, tk.END)
+
+    def _get_urls(self) -> List[str]:
+        raw = self.url_text.get(1.0, tk.END).strip().splitlines()
+        return [u.strip() for u in raw if u.strip()]
+
+    def _start_conversion(self):
+        urls = self._get_urls()
+        if not urls:
+            messagebox.showerror("Hata", "Lütfen en az bir URL girin.")
+            return
+        self.result_listbox.delete(0, tk.END)
+        self.progress_var.set(0)
+        self.status_label.config(text="İşlem başlatılıyor...")
+        self.controller.start(urls)
+
+    def _stop_conversion(self):
+        if self.controller.is_running:
+            self.controller.stop()
+            self.status_label.config(text="Durduruluyor...")
+        else:
+            messagebox.showinfo("Bilgi", "Devam eden işlem yok.")
+
+    def _poll_queue(self):
+        try:
+            while True:
+                msg = self.msg_queue.get_nowait()
+                self._handle_message(msg)
+        except queue.Empty:
+            pass
+        finally:
+            self.after(100, self._poll_queue)
+
+    def _handle_message(self, msg):
+        msg_type = msg[0]
+        if msg_type == 'progress':
+            _, percent, text = msg
+            self.progress_var.set(percent)
+            self.status_label.config(text=text)
+        elif msg_type == 'result':
+            _, url, pptx_path = msg
+            self.result_listbox.insert(tk.END, f"✔ BAŞARILI - {url} -> {pptx_path}")
+        elif msg_type == 'error':
+            _, url, err = msg
+            self.result_listbox.insert(tk.END, f"✘ HATA - {url}: {err}")
+        elif msg_type == 'messagebox':
+            _, title, text = msg
+            messagebox.showwarning(title, text)
+        elif msg_type == 'finished':
+            _, success, total = msg
+            self.status_label.config(text=f"İşlem tamamlandı. Başarılı: {success}/{total}")
+            if success == total:
+                messagebox.showinfo("Bitti", "Tüm videolar başarıyla dönüştürüldü.\nÇıktılar ana dizinde.")
+            else:
+                messagebox.showwarning("Bitti", f"{success}/{total} başarılı.\nHatalar için listeye bakın.")
+        elif msg_type == 'open_ppt_editor':
+            _, pptx_path, video_path = msg
+            self.notebook.select(self.editor_tab)
+            self.editor_frame.set_pptx_and_video(pptx_path, video_path)
+
+    def _on_close(self):
+        if self.controller.is_running:
+            if not messagebox.askokcancel("Çıkış", "İşlem devam ediyor. Çıkılsın mı?"):
+                return
+            self.controller.stop()
+        self.destroy()
+
+// === C://Users//BERAT//Desktop//video_to_ppt\gui\ppt_grid_controller.py ===
+
+from typing import List, Optional, Callable
+from PIL import Image
+from domain.i_pptx_reader import IPPTXReader
+from domain.i_pptx_writer import IPPTXWriter
+from domain.i_grid_composer import IGridComposer
+from utils.grid_utils import calculate_grid_dimensions
+from infrastructure.high_res_frame_extractor import HighResFrameExtractor
+from utils.url_resolver import resolve_video_url
+import re
+import cv2
+import numpy as np
+
+class PPTGridController:
+    def __init__(self, reader: IPPTXReader, writer: IPPTXWriter, composer: IGridComposer):
+        self.reader = reader
+        self.writer = writer
+        self.composer = composer
+
+    def get_slide_count(self) -> int:
+        return self.reader.get_slide_count()
+
+    def get_slide_preview(self, index: int, max_size: int = 100) -> Optional[Image.Image]:
+        return self.reader.get_first_image_thumbnail(index, max_size)
+
+    def delete_slides(self, selected_indices: List[int]) -> None:
+        if not selected_indices:
+            raise ValueError("Silinecek slayt seçilmedi")
+        self.writer.delete_slides(selected_indices)
+        self.reader.update_from_writer(self.writer)
+
+    def apply_grid(self, selected_indices: List[int], margin: int = 10) -> None:
+        if len(selected_indices) < 2:
+            raise ValueError("En az iki slayt seçmelisiniz")
+        images = []
+        for idx in selected_indices:
+            imgs = self.reader.get_slide_images(idx)
+            images.extend(imgs)
+        if not images:
+            raise ValueError("Seçilen slaytlarda hiç resim bulunamadı")
+        rows, cols = calculate_grid_dimensions(len(images))
+        grid_image = self.composer.compose(images, rows, cols, margin)
+        self.writer.rebuild_with_grid(selected_indices, grid_image)
+        self.reader.update_from_writer(self.writer)
+
+    def save(self, path: str) -> None:
+        self.writer.save(path)
+
+    def close(self):
+        self.reader.close()
+        self.writer.close()
+
+    def upgrade_slides(self, selected_indices: List[int], target_width: int = 1920, progress_callback: Optional[Callable[[int, int, int], None]] = None) -> None:
+        if not selected_indices:
+            raise ValueError("Yükseltilecek slayt seçilmedi")
+
+        first_slide_text = self.reader.get_slide_text(0)
+        youtube_url = self._extract_url_from_text(first_slide_text)
+        if not youtube_url:
+            raise ValueError("İlk slaytta video URL'si bulunamadı")
+
+        video_stream_url = resolve_video_url(youtube_url)
+        if not video_stream_url:
+            raise ValueError("Video akış URL'si alınamadı")
+
+        extractor = HighResFrameExtractor(video_stream_url)
+        total = len(selected_indices)
+        for i, idx in enumerate(selected_indices):
+            if progress_callback:
+                progress_callback(i, total, idx)
+            slide_text = self.reader.get_slide_text(idx)
+            seconds = self._extract_timestamp_from_text(slide_text)
+            if seconds is None:
+                continue
+            high_res_bgr = extractor.extract_frame(seconds, target_width=target_width)
+            if high_res_bgr is None:
+                continue
+            # numpy BGR'yi PIL RGB'ye çevir
+            high_res_rgb = cv2.cvtColor(high_res_bgr, cv2.COLOR_BGR2RGB)
+            high_res_pil = Image.fromarray(high_res_rgb)
+            self.writer.replace_slide_image(idx, high_res_pil)
+        self.reader.update_from_writer(self.writer)
+
+    def _extract_url_from_text(self, text: str) -> Optional[str]:
+        match = re.search(r'Video URL:\s*(https?://[^\s]+)', text)
+        return match.group(1) if match else None
+
+    def _extract_timestamp_from_text(self, text: str) -> Optional[float]:
+        match = re.search(r'(\d{2}):(\d{2}):(\d{3})', text)
+        if match:
+            minutes = int(match.group(1))
+            seconds = int(match.group(2))
+            ms = int(match.group(3))
+            return minutes * 60 + seconds + ms / 1000.0
+        return None
+
+// === C://Users//BERAT//Desktop//video_to_ppt\gui\ppt_grid_editor_frame.py ===
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import json
+import os
+import threading
+from PIL import ImageTk
+from infrastructure.python_pptx_reader import PythonPPTXReader
+from infrastructure.python_pptx_writer import PythonPPTXWriter
+from infrastructure.grid_composer import PillowGridComposer
+from gui.ppt_grid_controller import PPTGridController
+
+class PPTGridEditorFrame(ttk.Frame):
+    def __init__(self, parent, temp_video_path=None):
+        super().__init__(parent)
+        self.controller = None
+        self.thumbnails = []
+        self.selected_indices = []
+        self.settings_file = os.path.join(os.path.dirname(__file__), "..", "config", "ppt_grid_settings.json")
+        self.current_pptx_path = None
+        self.pptx_files = []
+        self.temp_video_path = temp_video_path
+        self._create_widgets()
+        self.load_last_working_directory()
+        self._bind_mousewheel()
+
+    def _bind_mousewheel(self):
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.canvas.bind_all("<Button-4>", self._on_mousewheel)
+        self.canvas.bind_all("<Button-5>", self._on_mousewheel)
+
+    def _on_mousewheel(self, event):
+        if event.num == 4 or (hasattr(event, 'delta') and event.delta > 0):
+            self.canvas.yview_scroll(-1, "units")
+        elif event.num == 5 or (hasattr(event, 'delta') and event.delta < 0):
+            self.canvas.yview_scroll(1, "units")
+        else:
+            self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+
+    def _create_widgets(self):
+        top_frame = ttk.Frame(self)
+        top_frame.pack(pady=5, fill=tk.X, padx=10)
+
+        ttk.Label(top_frame, text="Çalışma Klasörü:").pack(side=tk.LEFT, padx=5)
+        self.folder_path_var = tk.StringVar()
+        self.folder_entry = ttk.Entry(top_frame, textvariable=self.folder_path_var, width=40)
+        self.folder_entry.pack(side=tk.LEFT, padx=5)
+        ttk.Button(top_frame, text="Klasör Seç", command=self.browse_folder).pack(side=tk.LEFT)
+        ttk.Button(top_frame, text="Varsayılan Yap", command=self.set_as_default).pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(top_frame, text="Dosya Seç:").pack(side=tk.LEFT, padx=5)
+        self.file_combo = ttk.Combobox(top_frame, width=30, state="readonly")
+        self.file_combo.pack(side=tk.LEFT, padx=5)
+        self.file_combo.bind("<<ComboboxSelected>>", self.on_file_selected)
+
+        btn_frame = ttk.Frame(self)
+        btn_frame.pack(pady=10)
+        self.btn_delete = ttk.Button(btn_frame, text="Seçili Slaytları Sil", command=self.delete_selected)
+        self.btn_delete.pack(side=tk.LEFT, padx=10)
+        self.btn_grid = ttk.Button(btn_frame, text="Seçili Slaytları Grid Slaytta Birleştir", command=self.grid_selected)
+        self.btn_grid.pack(side=tk.LEFT, padx=10)
+        self.btn_upgrade = ttk.Button(btn_frame, text="Seçili Slaytları Yüksek Kaliteye Yükselt", command=self.upgrade_selected)
+        self.btn_upgrade.pack(side=tk.LEFT, padx=10)
+        self._disable_buttons()
+
+        frame_canvas = ttk.Frame(self)
+        frame_canvas.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        self.canvas = tk.Canvas(frame_canvas, bg='#f0f0f0')
+        scrollbar_y = ttk.Scrollbar(frame_canvas, orient=tk.VERTICAL, command=self.canvas.yview)
+        scrollbar_x = ttk.Scrollbar(frame_canvas, orient=tk.HORIZONTAL, command=self.canvas.xview)
+        self.canvas.configure(yscrollcommand=scrollbar_y.set, xscrollcommand=scrollbar_x.set)
+        scrollbar_y.pack(side=tk.RIGHT, fill=tk.Y)
+        scrollbar_x.pack(side=tk.BOTTOM, fill=tk.X)
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.inner = ttk.Frame(self.canvas)
+        self.canvas.create_window((0,0), window=self.inner, anchor="nw")
+        self.inner.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+
+        self.status_label = ttk.Label(self, text="", anchor="w")
+        self.status_label.pack(fill=tk.X, padx=10, pady=5)
+
+    def load_last_working_directory(self):
+        try:
+            with open(self.settings_file, "r") as f:
+                data = json.load(f)
+                folder = data.get("working_directory")
+                if folder and os.path.isdir(folder):
+                    self.folder_path_var.set(folder)
+                    self.refresh_pptx_list()
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+
+    def set_as_default(self):
+        folder = self.folder_path_var.get().strip()
+        if not folder or not os.path.isdir(folder):
+            messagebox.showerror("Hata", "Geçerli bir klasör seçin")
+            return
+        os.makedirs(os.path.dirname(self.settings_file), exist_ok=True)
+        with open(self.settings_file, "w") as f:
+            json.dump({"working_directory": folder}, f)
+        messagebox.showinfo("Başarılı", "Bu klasör varsayılan çalışma klasörü olarak kaydedildi.")
+
+    def browse_folder(self):
+        folder = filedialog.askdirectory(title="Çalışma Klasörünü Seçin")
+        if folder:
+            self.folder_path_var.set(folder)
+            self.refresh_pptx_list()
+
+    def refresh_pptx_list(self):
+        folder = self.folder_path_var.get().strip()
+        if not folder or not os.path.isdir(folder):
+            self.file_combo['values'] = []
+            return
+        files = [f for f in os.listdir(folder) if f.lower().endswith(".pptx")]
+        self.pptx_files = [(os.path.join(folder, f), f) for f in files]
+        self.file_combo['values'] = [f for _, f in self.pptx_files]
+        if self.pptx_files:
+            self.file_combo.current(0)
+            self.on_file_selected()
+        else:
+            self.file_combo.set("")
+            self.status_label.config(text="Klasörde PowerPoint dosyası bulunamadı")
+            self._disable_buttons()
+
+    def _disable_buttons(self):
+        self.btn_delete.config(state=tk.DISABLED)
+        self.btn_grid.config(state=tk.DISABLED)
+        self.btn_upgrade.config(state=tk.DISABLED)
+
+    def _enable_buttons(self):
+        self.btn_delete.config(state=tk.NORMAL)
+        self.btn_grid.config(state=tk.NORMAL)
+        self.btn_upgrade.config(state=tk.NORMAL)
+
+    def on_file_selected(self, event=None):
+        selection = self.file_combo.current()
+        if selection < 0 or selection >= len(self.pptx_files):
+            return
+        full_path = self.pptx_files[selection][0]
+        self.current_pptx_path = full_path
+        self.load_pptx(full_path)
+
+    def load_pptx(self, path):
+        try:
+            reader = PythonPPTXReader(path)
+            writer = PythonPPTXWriter(path)
+            composer = PillowGridComposer()
+            self.controller = PPTGridController(reader, writer, composer)
+            self.refresh_slides()
+            self._enable_buttons()
+            self.status_label.config(text=f"Yüklendi: {os.path.basename(path)}")
+        except Exception as e:
+            messagebox.showerror("Hata", f"Dosya açılamadı: {e}")
+            self._disable_buttons()
+
+    def refresh_slides(self):
+        for widget in self.inner.winfo_children():
+            widget.destroy()
+        self.thumbnails.clear()
+        self.selected_indices.clear()
+        count = self.controller.get_slide_count()
+        if count == 0:
+            ttk.Label(self.inner, text="Slayt yok").pack()
+            return
+        cols = 3
+        thumb_size = 220
+        for idx in range(count):
+            if idx % cols == 0:
+                row_frame = ttk.Frame(self.inner)
+                row_frame.pack(anchor="w", pady=10)
+            slide_frame = tk.Frame(row_frame, relief=tk.RIDGE, borderwidth=1, bg='white')
+            slide_frame.pack(side=tk.LEFT, padx=10, pady=5)
+
+            img = self.controller.get_slide_preview(idx, max_size=thumb_size)
+            photo = None
+            if img:
+                photo = ImageTk.PhotoImage(img)
+                label_img = tk.Label(slide_frame, image=photo, bg='white')
+                label_img.image = photo
+                label_img.pack(padx=2, pady=2)
+            else:
+                placeholder = tk.Label(slide_frame, text="[Resim yok]", width=25, height=15, bg='lightgray')
+                placeholder.pack()
+
+            lbl_num = tk.Label(slide_frame, text=f"Slayt {idx+1}", font=("Arial", 10, "bold"), bg='white')
+            lbl_num.pack()
+            var = tk.BooleanVar()
+            cb = ttk.Checkbutton(slide_frame, variable=var, text="Seç", command=lambda i=idx, v=var: self._toggle(i, v))
+            cb.pack()
+            self.thumbnails.append((photo, var, idx))
+
+        self.inner.update_idletasks()
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _toggle(self, idx, var):
+        if var.get():
+            if idx not in self.selected_indices:
+                self.selected_indices.append(idx)
+        else:
+            if idx in self.selected_indices:
+                self.selected_indices.remove(idx)
+
+    def delete_selected(self):
+        if not self.selected_indices:
+            messagebox.showerror("Hata", "Silinecek slayt seçin")
+            return
+        try:
+            self.status_label.config(text="Slaytlar siliniyor...")
+            self.update_idletasks()
+            self.controller.delete_slides(self.selected_indices)
+            self.controller.save(self.current_pptx_path)
+            self.status_label.config(text="Silme tamamlandı, slaytlar güncellendi.")
+            self.refresh_slides()
+        except Exception as e:
+            messagebox.showerror("Hata", str(e))
+            self.status_label.config(text="Hata oluştu")
+
+    def grid_selected(self):
+        if len(self.selected_indices) < 2:
+            messagebox.showerror("Hata", "En az iki slayt seçmelisiniz")
+            return
+        try:
+            self.status_label.config(text="Birleştiriliyor...")
+            self.update_idletasks()
+            self.controller.apply_grid(self.selected_indices, margin=10)
+            self.controller.save(self.current_pptx_path)
+            self.status_label.config(text="Birleştirme tamamlandı, slaytlar güncellendi.")
+            self.refresh_slides()
+        except Exception as e:
+            messagebox.showerror("Hata", str(e))
+            self.status_label.config(text="Hata oluştu")
+
+    def upgrade_selected(self):
+        if not self.selected_indices:
+            messagebox.showerror("Hata", "Yükseltilecek slayt seçin")
+            return
+        self.btn_upgrade.config(state=tk.DISABLED)
+        self.btn_grid.config(state=tk.DISABLED)
+        self.btn_delete.config(state=tk.DISABLED)
+
+        total = len(self.selected_indices)
+        self.status_label.config(text=f"Yüksek kaliteli kareler alınıyor (0/{total})...")
+        self.update_idletasks()
+
+        def task():
+            try:
+                def progress_callback(current, total, slide_idx):
+                    self.after(0, lambda: self.status_label.config(
+                        text=f"Yüksek kaliteli kareler alınıyor ({current+1}/{total}) - Slayt {slide_idx+1}..."
+                    ))
+                self.controller.upgrade_slides(self.selected_indices, target_width=1280, progress_callback=progress_callback)
+                self.controller.save(self.current_pptx_path)
+                self.after(0, self._upgrade_finished_success)
+            except Exception as e:
+                error_msg = str(e)
+                self.after(0, lambda: self._upgrade_finished_error(error_msg))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _upgrade_finished_success(self):
+        self.status_label.config(text="Yükseltme tamamlandı, slaytlar güncellendi.")
+        self.refresh_slides()
+        self._enable_buttons()
+        for _, var, _ in self.thumbnails:
+            var.set(False)
+        self.selected_indices.clear()
+        messagebox.showinfo("Tamamlandı", "Seçili slaytlar yüksek kaliteye yükseltildi.")
+
+    def _upgrade_finished_error(self, error_msg):
+        messagebox.showerror("Hata", f"Yükseltme sırasında hata:\n{error_msg}")
+        self.status_label.config(text="Hata oluştu")
+        self._enable_buttons()
+
+    def set_pptx_and_video(self, pptx_path, video_path):
+        self.temp_video_path = video_path
+        if pptx_path and os.path.exists(pptx_path):
+            self.current_pptx_path = pptx_path
+            folder = os.path.dirname(pptx_path)
+            self.folder_path_var.set(folder)
+            self.refresh_pptx_list()
+            for i, (fp, fn) in enumerate(self.pptx_files):
+                if fp == pptx_path:
+                    self.file_combo.current(i)
+                    self.on_file_selected()
+                    break
+
+// === C://Users//BERAT//Desktop//video_to_ppt\gui\ppt_grid_tool_window.py ===
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import json
+import os
+import threading
+from PIL import ImageTk
+from infrastructure.python_pptx_reader import PythonPPTXReader
+from infrastructure.python_pptx_writer import PythonPPTXWriter
+from infrastructure.grid_composer import PillowGridComposer
+from gui.ppt_grid_controller import PPTGridController
+
+class PPTGridToolWindow(tk.Toplevel):
+    def __init__(self, parent, default_pptx_path=None, temp_video_path=None):
+        super().__init__(parent)
+        self.title("PowerPoint Düzenleme Aracı")
+        self.geometry("1100x800")
+        self.controller = None
+        self.thumbnails = []
+        self.selected_indices = []
+        self.settings_file = os.path.join(os.path.dirname(__file__), "..", "config", "ppt_grid_settings.json")
+        self.current_pptx_path = None
+        self.pptx_files = []
+        self.temp_video_path = temp_video_path
+
+        self._create_widgets()
+        self.load_last_working_directory()
+        self._bind_mousewheel()
+
+        if default_pptx_path and os.path.exists(default_pptx_path):
+            self.current_pptx_path = default_pptx_path
+            self.load_pptx(default_pptx_path)
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close_cleanup)
+
+    def _on_close_cleanup(self):
+        if self.temp_video_path and os.path.exists(self.temp_video_path):
+            try:
+                os.unlink(self.temp_video_path)
+                print(f"[Cleanup] Geçici video silindi: {self.temp_video_path}")
+            except Exception as e:
+                print(f"[Cleanup] Video silinemedi: {e}")
+        self.destroy()
+
+    def _bind_mousewheel(self):
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.canvas.bind_all("<Button-4>", self._on_mousewheel)
+        self.canvas.bind_all("<Button-5>", self._on_mousewheel)
+
+    def _on_mousewheel(self, event):
+        if event.num == 4 or (hasattr(event, 'delta') and event.delta > 0):
+            self.canvas.yview_scroll(-1, "units")
+        elif event.num == 5 or (hasattr(event, 'delta') and event.delta < 0):
+            self.canvas.yview_scroll(1, "units")
+        else:
+            self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+
+    def _create_widgets(self):
+        top_frame = tk.Frame(self)
+        top_frame.pack(pady=5, fill=tk.X, padx=10)
+
+        tk.Label(top_frame, text="Çalışma Klasörü:").pack(side=tk.LEFT, padx=5)
+        self.folder_path_var = tk.StringVar()
+        self.folder_entry = tk.Entry(top_frame, textvariable=self.folder_path_var, width=40)
+        self.folder_entry.pack(side=tk.LEFT, padx=5)
+        tk.Button(top_frame, text="Klasör Seç", command=self.browse_folder).pack(side=tk.LEFT)
+        tk.Button(top_frame, text="Varsayılan Yap", command=self.set_as_default).pack(side=tk.LEFT, padx=5)
+
+        tk.Label(top_frame, text="Dosya Seç:").pack(side=tk.LEFT, padx=5)
+        self.file_combo = ttk.Combobox(top_frame, width=30, state="readonly")
+        self.file_combo.pack(side=tk.LEFT, padx=5)
+        self.file_combo.bind("<<ComboboxSelected>>", self.on_file_selected)
+
+        btn_frame = tk.Frame(self)
+        btn_frame.pack(pady=10)
+        self.btn_delete = tk.Button(btn_frame, text="Seçili Slaytları Sil", command=self.delete_selected, bg="#ff9999")
+        self.btn_delete.pack(side=tk.LEFT, padx=10)
+        self.btn_grid = tk.Button(btn_frame, text="Seçili Slaytları Grid Slaytta Birleştir", command=self.grid_selected, bg="#99ccff")
+        self.btn_grid.pack(side=tk.LEFT, padx=10)
+        self.btn_upgrade = tk.Button(btn_frame, text="Seçili Slaytları Yüksek Kaliteye Yükselt", command=self.upgrade_selected, bg="#aaffaa")
+        self.btn_upgrade.pack(side=tk.LEFT, padx=10)
+        self.btn_grid.config(state=tk.DISABLED)
+        self.btn_delete.config(state=tk.DISABLED)
+        self.btn_upgrade.config(state=tk.DISABLED)
+
+        frame_canvas = tk.Frame(self)
+        frame_canvas.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        self.canvas = tk.Canvas(frame_canvas)
+        scrollbar_y = tk.Scrollbar(frame_canvas, orient=tk.VERTICAL, command=self.canvas.yview)
+        scrollbar_x = tk.Scrollbar(frame_canvas, orient=tk.HORIZONTAL, command=self.canvas.xview)
+        self.canvas.configure(yscrollcommand=scrollbar_y.set, xscrollcommand=scrollbar_x.set)
+        scrollbar_y.pack(side=tk.RIGHT, fill=tk.Y)
+        scrollbar_x.pack(side=tk.BOTTOM, fill=tk.X)
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.inner = tk.Frame(self.canvas)
+        self.canvas.create_window((0,0), window=self.inner, anchor="nw")
+        self.inner.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+
+        self.status_label = tk.Label(self, text="", anchor="w")
+        self.status_label.pack(fill=tk.X, padx=10, pady=5)
+
+    def load_last_working_directory(self):
+        try:
+            with open(self.settings_file, "r") as f:
+                data = json.load(f)
+                folder = data.get("working_directory")
+                if folder and os.path.isdir(folder):
+                    self.folder_path_var.set(folder)
+                    self.refresh_pptx_list()
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+
+    def set_as_default(self):
+        folder = self.folder_path_var.get().strip()
+        if not folder or not os.path.isdir(folder):
+            messagebox.showerror("Hata", "Geçerli bir klasör seçin")
+            return
+        os.makedirs(os.path.dirname(self.settings_file), exist_ok=True)
+        with open(self.settings_file, "w") as f:
+            json.dump({"working_directory": folder}, f)
+        messagebox.showinfo("Başarılı", "Bu klasör varsayılan çalışma klasörü olarak kaydedildi.")
+
+    def browse_folder(self):
+        folder = filedialog.askdirectory(title="Çalışma Klasörünü Seçin")
+        if folder:
+            self.folder_path_var.set(folder)
+            self.refresh_pptx_list()
+
+    def refresh_pptx_list(self):
+        folder = self.folder_path_var.get().strip()
+        if not folder or not os.path.isdir(folder):
+            self.file_combo['values'] = []
+            self.status_label.config(text="Klasör geçerli değil")
+            return
+        files = [f for f in os.listdir(folder) if f.lower().endswith(".pptx")]
+        self.pptx_files = [(os.path.join(folder, f), f) for f in files]
+        self.file_combo['values'] = [f for _, f in self.pptx_files]
+        if self.pptx_files:
+            self.file_combo.current(0)
+            self.on_file_selected()
+        else:
+            self.file_combo.set("")
+            self.status_label.config(text="Klasörde PowerPoint dosyası bulunamadı")
+            self.btn_grid.config(state=tk.DISABLED)
+            self.btn_delete.config(state=tk.DISABLED)
+            self.btn_upgrade.config(state=tk.DISABLED)
+
+    def on_file_selected(self, event=None):
+        selection = self.file_combo.current()
+        if selection < 0 or selection >= len(self.pptx_files):
+            return
+        full_path = self.pptx_files[selection][0]
+        self.current_pptx_path = full_path
+        self.load_pptx(full_path)
+
+    def load_pptx(self, path):
+        try:
+            reader = PythonPPTXReader(path)
+            writer = PythonPPTXWriter(path)
+            composer = PillowGridComposer()
+            self.controller = PPTGridController(reader, writer, composer)
+            self.refresh_slides()
+            self.btn_grid.config(state=tk.NORMAL)
+            self.btn_delete.config(state=tk.NORMAL)
+            self.btn_upgrade.config(state=tk.NORMAL)
+            self.status_label.config(text=f"Yüklendi: {os.path.basename(path)}")
+        except Exception as e:
+            messagebox.showerror("Hata", f"Dosya açılamadı: {e}")
+            self.btn_grid.config(state=tk.DISABLED)
+            self.btn_delete.config(state=tk.DISABLED)
+            self.btn_upgrade.config(state=tk.DISABLED)
+
+    def refresh_slides(self):
+        for widget in self.inner.winfo_children():
+            widget.destroy()
+        self.thumbnails.clear()
+        self.selected_indices.clear()
+        count = self.controller.get_slide_count()
+        if count == 0:
+            tk.Label(self.inner, text="Slayt yok").pack()
+            return
+        cols = 3
+        thumb_size = 250
+        for idx in range(count):
+            if idx % cols == 0:
+                row_frame = tk.Frame(self.inner)
+                row_frame.pack(anchor="w", pady=10)
+            slide_frame = tk.Frame(row_frame, relief=tk.RIDGE, borderwidth=2, padx=5, pady=5)
+            slide_frame.pack(side=tk.LEFT, padx=10, pady=5)
+
+            img = self.controller.get_slide_preview(idx, max_size=thumb_size)
+            photo = None
+            if img:
+                photo = ImageTk.PhotoImage(img)
+                label_img = tk.Label(slide_frame, image=photo)
+                label_img.image = photo
+                label_img.pack()
+            else:
+                placeholder = tk.Label(slide_frame, text="[Resim yok]", width=30, height=20, bg='lightgray')
+                placeholder.pack()
+
+            lbl_num = tk.Label(slide_frame, text=f"Slayt {idx+1}", font=("Arial", 12, "bold"))
+            lbl_num.pack()
+            var = tk.BooleanVar()
+            cb = tk.Checkbutton(slide_frame, variable=var, text="Seç", font=("Arial", 10),
+                                command=lambda i=idx, v=var: self._toggle(i, v))
+            cb.pack()
+            self.thumbnails.append((photo, var, idx))
+
+        self.inner.update_idletasks()
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _toggle(self, idx, var):
+        if var.get():
+            if idx not in self.selected_indices:
+                self.selected_indices.append(idx)
+        else:
+            if idx in self.selected_indices:
+                self.selected_indices.remove(idx)
+
+    def delete_selected(self):
+        if not self.selected_indices:
+            messagebox.showerror("Hata", "Silinecek slayt seçin")
+            return
+        try:
+            self.status_label.config(text="Slaytlar siliniyor...")
+            self.update_idletasks()
+            self.controller.delete_slides(self.selected_indices)
+            self.controller.save(self.current_pptx_path)
+            self.status_label.config(text="Silme tamamlandı, slaytlar güncellendi.")
+            self.refresh_slides()
+        except Exception as e:
+            messagebox.showerror("Hata", str(e))
+            self.status_label.config(text="Hata oluştu")
+
+    def grid_selected(self):
+        if len(self.selected_indices) < 2:
+            messagebox.showerror("Hata", "En az iki slayt seçmelisiniz")
+            return
+        try:
+            self.status_label.config(text="Birleştiriliyor...")
+            self.update_idletasks()
+            self.controller.apply_grid(self.selected_indices, margin=10)
+            self.controller.save(self.current_pptx_path)
+            self.status_label.config(text="Birleştirme tamamlandı, slaytlar güncellendi.")
+            self.refresh_slides()
+        except Exception as e:
+            messagebox.showerror("Hata", str(e))
+            self.status_label.config(text="Hata oluştu")
+
+    def upgrade_selected(self):
+        if not self.selected_indices:
+            messagebox.showerror("Hata", "Yükseltilecek slayt seçin")
+            return
+
+        self.btn_upgrade.config(state=tk.DISABLED)
+        self.btn_grid.config(state=tk.DISABLED)
+        self.btn_delete.config(state=tk.DISABLED)
+
+        total = len(self.selected_indices)
+        self.status_label.config(text=f"Yüksek kaliteli kareler alınıyor (0/{total})...")
+        self.update_idletasks()
+
+        def task():
+            try:
+                def progress_callback(current, total, slide_idx):
+                    self.after(0, lambda: self.status_label.config(
+                        text=f"Yüksek kaliteli kareler alınıyor ({current+1}/{total}) - Slayt {slide_idx+1}..."
+                    ))
+                self.controller.upgrade_slides(self.selected_indices, target_width=1280, progress_callback=progress_callback)
+                self.controller.save(self.current_pptx_path)
+                self.after(0, self._upgrade_finished_success)
+            except Exception as e:
+                error_msg = str(e)
+                self.after(0, lambda: self._upgrade_finished_error(error_msg))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _upgrade_finished_success(self):
+        self.status_label.config(text="Yükseltme tamamlandı, slaytlar güncellendi.")
+        self.refresh_slides()
+        self.btn_upgrade.config(state=tk.NORMAL)
+        self.btn_grid.config(state=tk.NORMAL)
+        self.btn_delete.config(state=tk.NORMAL)
+        for _, var, _ in self.thumbnails:
+            var.set(False)
+        self.selected_indices.clear()
+        messagebox.showinfo("Tamamlandı", "Seçili slaytlar yüksek kaliteye yükseltildi.")
+
+    def _upgrade_finished_error(self, error_msg):
+        messagebox.showerror("Hata", f"Yükseltme sırasında hata:\n{error_msg}")
+        self.status_label.config(text="Hata oluştu")
+        self.btn_upgrade.config(state=tk.NORMAL)
+        self.btn_grid.config(state=tk.NORMAL)
+        self.btn_delete.config(state=tk.NORMAL)
+
+// === C://Users//BERAT//Desktop//video_to_ppt\gui\progress_bar.py ===
+
+import tkinter.ttk as ttk
+
+class ProgressBar:
+    def __init__(self, parent, max_value=100):
+        self.bar = ttk.Progressbar(parent, maximum=max_value)
+        self.bar.pack(fill='x', padx=10, pady=5)
+        
+    def set_value(self, value):
+        self.bar['value'] = value
+        
+    def set_max(self, value):
+        self.bar['maximum'] = value
+        
+    def pack(self, **kwargs):
+        self.bar.pack(**kwargs)
+
+
+// === C://Users//BERAT//Desktop//video_to_ppt\gui\subtitle_view.py ===
+
+
+
+
+// === C://Users//BERAT//Desktop//video_to_ppt\gui\__init__.py ===
+
+
+
+
+// === C://Users//BERAT//Desktop//video_to_ppt\infrastructure\grid_composer.py ===
+
+from PIL import Image
+from typing import List
+from domain.i_grid_composer import IGridComposer
+
+class PillowGridComposer(IGridComposer):
+    def compose(self, images: List[Image.Image], rows: int, cols: int, margin: int = 10) -> Image.Image:
+        if len(images) > rows * cols:
+            raise ValueError("Too many images for grid size")
+        max_w = max(img.width for img in images)
+        max_h = max(img.height for img in images)
+        processed = []
+        for img in images:
+            canvas = Image.new("RGB", (max_w, max_h), (255,255,255))
+            ratio = min(max_w/img.width, max_h/img.height)
+            new_w = int(img.width * ratio)
+            new_h = int(img.height * ratio)
+            img_resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+            x = (max_w - new_w) // 2
+            y = (max_h - new_h) // 2
+            canvas.paste(img_resized, (x, y))
+            processed.append(canvas)
+        grid_w = cols * max_w + (cols - 1) * margin
+        grid_h = rows * max_h + (rows - 1) * margin
+        grid = Image.new("RGB", (grid_w, grid_h), (255,255,255))
+        for idx, img in enumerate(processed):
+            row = idx // cols
+            col = idx % cols
+            x = col * (max_w + margin)
+            y = row * (max_h + margin)
+            grid.paste(img, (x, y))
+        return grid
+
+// === C://Users//BERAT//Desktop//video_to_ppt\infrastructure\high_res_frame_extractor.py ===
+
+import subprocess as sp
+import io
+import cv2
+import numpy as np
+from PIL import Image
+from typing import Optional
+from utils.ffmpeg_utils import get_ffmpeg_path
+
+class HighResFrameExtractor:
+    def __init__(self, video_url: str):
+        self.video_url = video_url
+        self.ffmpeg_path = get_ffmpeg_path()
+        print(f"[HighResFrameExtractor] URL: {video_url[:100]}...")
+
+    def extract_frame(self, seconds: float, target_width: int = 1920, timeout: int = 30) -> Optional[np.ndarray]:
+        print(f"[HighResFrameExtractor] Kare alınıyor: zaman={seconds:.3f} sn, genişlik={target_width}")
+        cmd = [
+            self.ffmpeg_path,
+            '-ss', str(seconds),
+            '-i', self.video_url,
+            '-frames:v', '1',
+            '-f', 'image2pipe',
+            '-vcodec', 'png',
+            '-vf', f'scale={target_width}:-2',
+            '-loglevel', 'error',
+            '-'
+        ]
+        try:
+            proc = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.PIPE)
+            stdout, stderr = proc.communicate(timeout=timeout)
+            if proc.returncode != 0 or len(stdout) == 0:
+                raise RuntimeError(f"Frame alınamadı: {stderr.decode()}")
+            img = Image.open(io.BytesIO(stdout))
+            rgb = np.array(img.convert('RGB'))
+            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            return bgr
+        except sp.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+            raise RuntimeError(f"FFmpeg işlemi {timeout} saniyede zaman aşımına uğradı: {stderr.decode()[:500]}")
+
+// === C://Users//BERAT//Desktop//video_to_ppt\infrastructure\local_video_stream.py ===
+
+import cv2
+import numpy as np
+from typing import Optional, Dict
+from domain.i_video_stream import IVideoStream
+
+class LocalVideoStream(IVideoStream):
+    def __init__(self, file_path: str, target_fps: int = 1, target_width: int = 640):
+        self.file_path = file_path
+        self.target_fps = target_fps
+        self.target_width = target_width
+        self.cap = cv2.VideoCapture(file_path)
+        if not self.cap.isOpened():
+            raise IOError(f"Video açılamadı: {file_path}")
+        self._orig_fps = self.cap.get(cv2.CAP_PROP_FPS)
+        if self._orig_fps <= 0:
+            raise IOError("Video FPS bilgisi alınamadı")
+        self._frame_interval = max(1, int(round(self._orig_fps / target_fps)))
+        self._frame_index = 0
+        self._total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    def get_frame(self) -> Optional[np.ndarray]:
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, self._frame_index)
+        ret, frame = self.cap.read()
+        if not ret:
+            return None
+        self._frame_index += self._frame_interval
+        if self.target_width and frame.shape[1] > self.target_width:
+            ratio = self.target_width / frame.shape[1]
+            new_h = int(frame.shape[0] * ratio)
+            frame = cv2.resize(frame, (self.target_width, new_h), interpolation=cv2.INTER_LANCZOS4)
+        return frame
+
+    def get_info(self) -> Dict:
+        duration = self._total_frames / self._orig_fps if self._orig_fps > 0 else 0
+        return {
+            'title': 'Video',
+            'duration_seconds': duration,
+            'width': self.target_width,
+            'height': 0,
+            'fps': self.target_fps,
+        }
+
+    def close(self):
+        if self.cap:
+            self.cap.release()
+
+// === C://Users//BERAT//Desktop//video_to_ppt\infrastructure\opencv_scene_detector.py ===
+
+
+
+
+// === C://Users//BERAT//Desktop//video_to_ppt\infrastructure\pptx_slide_builder.py ===
+
+import io
+import cv2
+import numpy as np
+from PIL import Image
+from pptx import Presentation
+from pptx.util import Inches, Pt
+from domain.i_slide_builder import ISlideBuilder
+from config.settings import (
+    DEFAULT_TARGET_WIDTH,
+    JPEG_QUALITY,
+    DPI,
+    SLIDE_IMAGE_LEFT_INCH,
+    SLIDE_IMAGE_TOP_INCH,
+    SLIDE_TEXT_LEFT_INCH,
+    SLIDE_TEXT_TOP_INCH,
+    SLIDE_TEXT_WIDTH_INCH,
+    SLIDE_TEXT_HEIGHT_INCH,
+    SLIDE_FONT_SIZE_TIMESTAMP,
+    SLIDE_FONT_SIZE_TEXT,
+)
+from utils.image_utils import resize_image_to_max_width
+from utils.time_utils import format_timestamp
+
+
+class PptxSlideBuilder(ISlideBuilder):
+    def __init__(self, output_path: str, video_title: str, video_url: str = ""):
+        self.output_path = output_path
+        self.video_title = video_title
+        self.video_url = video_url
+        self.prs = Presentation()
+        self.current_slide = None
+        self.slide_count = 0
+
+    def create_new_slide(self) -> None:
+        slide_layout = self.prs.slide_layouts[6]  # boş layout
+        self.current_slide = self.prs.slides.add_slide(slide_layout)
+        self.slide_count += 1
+
+    def add_image(
+        self,
+        image: np.ndarray,
+        max_width: int = DEFAULT_TARGET_WIDTH,
+        quality: int = JPEG_QUALITY,
+        vertical_align: str = "top"
+    ) -> None:
+        if self.current_slide is None:
+            self.create_new_slide()
+
+        resized_bgr = resize_image_to_max_width(image, max_width)
+        rgb_image = cv2.cvtColor(resized_bgr, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(rgb_image)
+
+        slide_width_emu = self.prs.slide_width
+        slide_height_emu = self.prs.slide_height
+        emu_per_inch = 914400
+        slide_width_inch = slide_width_emu / emu_per_inch
+        slide_height_inch = slide_height_emu / emu_per_inch
+
+        image_width_inch = pil_img.width / DPI
+        image_height_inch = pil_img.height / DPI
+
+        if image_width_inch > slide_width_inch:
+            scale = slide_width_inch / image_width_inch
+            new_width = int(pil_img.width * scale)
+            new_height = int(pil_img.height * scale)
+            pil_img = pil_img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            image_width_inch = new_width / DPI
+            image_height_inch = new_height / DPI
+
+        left_inch = (slide_width_inch - image_width_inch) / 2.0
+
+        if vertical_align == "center":
+            top_inch = (slide_height_inch - image_height_inch) / 2.0
+        elif vertical_align == "bottom":
+            top_inch = slide_height_inch - image_height_inch - 1.0
+            if top_inch < 0:
+                top_inch = 0
+        else:
+            top_inch = SLIDE_IMAGE_TOP_INCH
+
+        img_buffer = io.BytesIO()
+        pil_img.save(img_buffer, format='JPEG', quality=quality)
+        img_buffer.seek(0)
+
+        left = Inches(left_inch)
+        top = Inches(top_inch)
+        self.current_slide.shapes.add_picture(
+            img_buffer, left, top,
+            width=Inches(image_width_inch),
+            height=Inches(image_height_inch)
+        )
+
+    def add_text(self, text: str, font_size: int = SLIDE_FONT_SIZE_TEXT, bold: bool = False) -> None:
+        if self.current_slide is None:
+            self.create_new_slide()
+
+        left = Inches(SLIDE_TEXT_LEFT_INCH)
+        top = Inches(SLIDE_TEXT_TOP_INCH)
+        width = Inches(SLIDE_TEXT_WIDTH_INCH)
+        height = Inches(SLIDE_TEXT_HEIGHT_INCH)
+
+        textbox = self.current_slide.shapes.add_textbox(left, top, width, height)
+        text_frame = textbox.text_frame
+        text_frame.text = text
+        paragraph = text_frame.paragraphs[0]
+        paragraph.font.size = Pt(font_size)
+        paragraph.font.bold = bold
+
+    def add_timestamp(self, seconds: float, video_title: str = "") -> None:
+        timestamp_str = format_timestamp(seconds, include_ms=True)   # milisaniyeli
+        title_str = video_title if video_title else self.video_title
+        footer_text = f"{title_str} - {timestamp_str}"
+        self.add_text(footer_text, font_size=SLIDE_FONT_SIZE_TIMESTAMP, bold=False)
+
+    def build(self) -> str:
+        self.prs.save(self.output_path)
+        return self.output_path
+
+// === C://Users//BERAT//Desktop//video_to_ppt\infrastructure\python_pptx_reader.py ===
+
+import io
+from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE
+from PIL import Image
+from typing import List, Optional
+from domain.i_pptx_reader import IPPTXReader
+
+class PythonPPTXReader(IPPTXReader):
+    def __init__(self, file_path: str):
+        self.file_path = file_path
+        self.prs = Presentation(file_path)
+
+    def get_slide_count(self) -> int:
+        return len(self.prs.slides)
+
+    def get_slide_images(self, slide_index: int) -> List[Image.Image]:
+        images = []
+        slide = self.prs.slides[slide_index]
+        for shape in slide.shapes:
+            if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                blob = shape.image.blob
+                img = Image.open(io.BytesIO(blob))
+                images.append(img)
+        return images
+
+    def get_first_image_thumbnail(self, slide_index: int, max_size: int = 100) -> Optional[Image.Image]:
+        images = self.get_slide_images(slide_index)
+        if not images:
+            return None
+        img = images[0]
+        img.thumbnail((max_size, max_size))
+        return img
+
+    def update_from_writer(self, writer) -> None:
+        if hasattr(writer, '_new_prs') and writer._new_prs:
+            self.prs = writer._new_prs
+        elif hasattr(writer, 'last_saved_path') and writer.last_saved_path:
+            self.prs = Presentation(writer.last_saved_path)
+
+    def get_slide_text(self, slide_index: int) -> str:
+        slide = self.prs.slides[slide_index]
+        texts = []
+        for shape in slide.shapes:
+            if shape.has_text_frame:
+                texts.append(shape.text)
+        return "\n".join(texts)
+
+    def close(self):
+        pass
+
+// === C://Users//BERAT//Desktop//video_to_ppt\infrastructure\python_pptx_writer.py ===
+
+import io
+from pptx import Presentation
+from pptx.util import Inches
+from PIL import Image
+from typing import List
+from domain.i_pptx_writer import IPPTXWriter
+
+class PythonPPTXWriter(IPPTXWriter):
+    def __init__(self, source_path: str):
+        self.source_path = source_path
+        self._new_prs = None
+        self.last_saved_path = None
+
+    def rebuild_with_grid(self, selected_indices: List[int], grid_image: Image.Image) -> None:
+        prs = Presentation(self.source_path)
+        new_prs = Presentation()
+        blank_layout = new_prs.slide_layouts[6]
+
+        for idx, slide in enumerate(prs.slides):
+            if idx in selected_indices:
+                continue
+            new_slide = new_prs.slides.add_slide(blank_layout)
+            self._copy_slide_content(slide, new_slide)
+
+        insert_pos = min(selected_indices) if selected_indices else 0
+        slides_list = list(new_prs.slides)
+        final_prs = Presentation()
+        final_layout = final_prs.slide_layouts[6]
+
+        for i in range(insert_pos):
+            if i < len(slides_list):
+                self._copy_slide_content(slides_list[i], final_prs.slides.add_slide(final_layout))
+
+        grid_slide = final_prs.slides.add_slide(final_layout)
+        img_buffer = io.BytesIO()
+        grid_image.save(img_buffer, format='PNG')
+        img_buffer.seek(0)
+        left = Inches(1)
+        top = Inches(1)
+        width = Inches(8)
+        height = Inches(6)
+        grid_slide.shapes.add_picture(img_buffer, left, top, width, height)
+
+        for i in range(insert_pos, len(slides_list)):
+            self._copy_slide_content(slides_list[i], final_prs.slides.add_slide(final_layout))
+
+        self._new_prs = final_prs
+
+    def delete_slides(self, selected_indices: List[int]) -> None:
+        prs = Presentation(self.source_path)
+        new_prs = Presentation()
+        blank_layout = new_prs.slide_layouts[6]
+
+        for idx, slide in enumerate(prs.slides):
+            if idx in selected_indices:
+                continue
+            new_slide = new_prs.slides.add_slide(blank_layout)
+            self._copy_slide_content(slide, new_slide)
+
+        self._new_prs = new_prs
+
+    def replace_slide_image(self, slide_index: int, new_image: Image.Image) -> None:
+        prs = self._new_prs if self._new_prs else Presentation(self.source_path)
+        slide = prs.slides[slide_index]
+        picture_shape = None
+        for shape in slide.shapes:
+            if shape.shape_type == 13:  # picture
+                picture_shape = shape
+                break
+        if picture_shape is None:
+            raise ValueError(f"Slayt {slide_index} içinde resim bulunamadı")
+        left, top, width, height = picture_shape.left, picture_shape.top, picture_shape.width, picture_shape.height
+        picture_shape.element.getparent().remove(picture_shape.element)
+        img_buffer = io.BytesIO()
+        new_image.save(img_buffer, format='PNG')
+        img_buffer.seek(0)
+        slide.shapes.add_picture(img_buffer, left, top, width, height)
+        self._new_prs = prs
+
+    def save(self, path: str = None) -> None:
+        if path is None:
+            path = self.source_path
+        self.last_saved_path = path
+        if self._new_prs is None:
+            prs = Presentation(self.source_path)
+            prs.save(path)
+        else:
+            self._new_prs.save(path)
+
+    def _copy_slide_content(self, src_slide, dst_slide):
+        for shape in src_slide.shapes:
+            if shape.has_text_frame:
+                textbox = dst_slide.shapes.add_textbox(shape.left, shape.top, shape.width, shape.height)
+                textbox.text = shape.text
+            elif shape.shape_type == 13:  # picture
+                blob = shape.image.blob
+                dst_slide.shapes.add_picture(io.BytesIO(blob), shape.left, shape.top, shape.width, shape.height)
+
+    def close(self):
+        pass
+
+// === C://Users//BERAT//Desktop//video_to_ppt\infrastructure\video_downloader.py ===
+
+import yt_dlp
+import tempfile
+import os
+import time
+import shutil
+from utils.ffmpeg_utils import get_ffmpeg_path
+
+class VideoDownloader:
+    def __init__(self):
+        self.temp_file = None
+        self.ffmpeg_path = get_ffmpeg_path()
+
+    def download(self, url: str) -> str:
+        # En kararlı format sırası
+        format_options = [
+            'best[ext=mp4]',           # En iyi mp4
+            'bestvideo[ext=mp4]+bestaudio',  # Ayrı video+ses, birleştir
+            'best',                    # En iyi herhangi bir format
+        ]
+
+        last_exception = None
+        for fmt in format_options:
+            # Her format için yeni bir geçici dosya oluştur
+            fd, path = tempfile.mkstemp(suffix='.mp4')
+            os.close(fd)
+
+            ydl_opts = {
+                'format': fmt,
+                'outtmpl': path,
+                'ffmpeg_location': self.ffmpeg_path,
+                'quiet': False,
+                'no_warnings': False,
+                'progress_hooks': [self._progress_hook],
+                'retries': 10,
+                'fragment_retries': 10,
+                'merge_output_format': 'mp4',
+                'overwrites': True,      # Var olanı sil
+                'continuedl': False,     # Kaldığı yerden devam etme
+                'nooverwrites': False,
+            }
+
+            try:
+                print(f"[Download] Denenen format: {fmt}")
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
+
+                time.sleep(0.5)
+                if os.path.exists(path) and os.path.getsize(path) > 0:
+                    print(f"[Download] Başarılı: {path} ({os.path.getsize(path)} bytes)")
+                    self.temp_file = path
+                    # Diğer format denemelerinden kalan dosyaları temizle (varsa)
+                    # Burada sadece başarılı dosyayı döneceğiz
+                    return path
+                else:
+                    raise RuntimeError("Dosya boş oluştu")
+            except Exception as e:
+                last_exception = e
+                print(f"[Download] {fmt} formatı başarısız: {e}")
+                # Başarısız dosyayı sil
+                if os.path.exists(path):
+                    os.unlink(path)
+                continue
+
+        if last_exception:
+            raise RuntimeError(f"Video indirilemedi: {last_exception}")
+        else:
+            raise RuntimeError("Video indirilemedi: Bilinmeyen hata")
+
+    def _progress_hook(self, d):
+        if d['status'] == 'downloading':
+            if d.get('total_bytes'):
+                percent = d['downloaded_bytes'] / d['total_bytes'] * 100
+                print(f"\rİndirme: %{percent:.1f}", end='')
+        elif d['status'] == 'finished':
+            print("\nİndirme tamamlandı, işleniyor...")
+
+    def cleanup(self):
+        if self.temp_file and os.path.exists(self.temp_file):
+            os.unlink(self.temp_file)
+            self.temp_file = None
+
+// === C://Users//BERAT//Desktop//video_to_ppt\infrastructure\yt_dlp_stream.py ===
+
+import yt_dlp
+from typing import Optional, Tuple, Dict
+import numpy as np
+from domain.i_video_stream import IVideoStream
+from infrastructure.frame_adapters import FallbackFrameReader, IFrameReader
+from config.settings import DEFAULT_FPS, DEFAULT_TARGET_WIDTH, YTDL_OPTS
+
+
+class YtDlpVideoStream(IVideoStream):
+    """
+    YouTube (ve diğer yt-dlp destekli siteler) videolarını indirmeden,
+    frame'lerini sırayla okumayı sağlar.
+    """
+
+    def __init__(self, url: str, target_fps: int = DEFAULT_FPS, target_width: int = DEFAULT_TARGET_WIDTH):
+        self.url = url
+        self.target_fps = target_fps
+        self.target_width = target_width
+        self._video_info: Optional[Dict] = None
+        self._frame_reader: Optional[IFrameReader] = None
+        self._current_resolution: Tuple[int, int] = (0, 0)
+        self._init_video_info()
+        self._open_stream()
+
+    def _init_video_info(self):
+        with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
+            try:
+                info = ydl.extract_info(self.url, download=False)
+                self._video_info = info
+            except Exception as e:
+                raise RuntimeError(f"Video bilgisi alınamadı: {e}")
+
+    def _get_best_stream_url(self) -> str:
+        formats = self._video_info.get('formats', [])
+        if not formats:
+            raise RuntimeError("Video için hiç format bulunamadı.")
+        best_format = self._select_best_format(formats)
+        if best_format:
+            return best_format['url']
+        direct_url = self._video_info.get('url')
+        if direct_url:
+            return direct_url
+        raise RuntimeError("Hiçbir formattan video akış URL'si alınamadı.")
+
+    def _select_best_format(self, formats: list) -> Optional[Dict]:
+        best_format = None
+        best_score = -1.0
+        for f in formats:
+            if f.get('url') is None:
+                continue
+            if f.get('vcodec', 'none') == 'none':
+                continue
+            score = self._calculate_format_score(f)
+            if score > best_score:
+                best_score = score
+                best_format = f
+        return best_format
+
+    @staticmethod
+    def _calculate_format_score(f: Dict) -> float:
+        height = f.get('height', 0)
+        tbr = f.get('tbr', 0)
+        has_audio = 1 if f.get('acodec', 'none') != 'none' else 0
+        # Sesli formatlara 1000 puan bonus (çözünürlük ve bitrate ile karşılaştırılabilir)
+        audio_bonus = has_audio * 1000
+        return height + tbr / 1000 + audio_bonus
+
+    def _calculate_resolution(self) -> Tuple[int, int]:
+        width = self._video_info.get('width', 1920)
+        height = self._video_info.get('height', 1080)
+        if width <= self.target_width:
+            return width, height
+        ratio = self.target_width / width
+        new_width = self.target_width
+        new_height = int(height * ratio)
+        # FFmpeg için çift sayı yap
+        new_height = new_height if new_height % 2 == 0 else new_height + 1
+        return new_width, new_height
+
+    def _open_stream(self):
+        if self._frame_reader:
+            self._frame_reader.release()
+        video_url = self._get_best_stream_url()
+        width, height = self._calculate_resolution()
+        self._current_resolution = (width, height)
+        # Doğrudan PipeFrameReader kullan
+        from infrastructure.frame_adapters.pipe_frame_reader import PipeFrameReader
+        self._frame_reader = PipeFrameReader(video_url, self.target_fps, (width, height))
+
+    def get_frame(self) -> Optional[np.ndarray]:
+        if self._frame_reader is None:
+            return None
+        return self._frame_reader.read_frame()
+
+    def get_info(self) -> Dict:
+        if not self._video_info:
+            return {}
+        return {
+            'title': self._video_info.get('title', 'Unknown'),
+            'duration_seconds': self._video_info.get('duration', 0),
+            'width': self._current_resolution[0],
+            'height': self._current_resolution[1],
+            'fps': self.target_fps,
+        }
+
+    def close(self) -> None:
+        if self._frame_reader:
+            self._frame_reader.release()
+            self._frame_reader = None
+
+// === C://Users//BERAT//Desktop//video_to_ppt\infrastructure\yt_subtitle_provider.py ===
+
+
+
+
+// === C://Users//BERAT//Desktop//video_to_ppt\infrastructure\__init__.py ===
+
+
+
+
+// === C://Users//BERAT//Desktop//video_to_ppt\infrastructure\frame_adapters\fallback_frame_reader.py ===
+
+# infrastructure/frame_adapters/fallback_frame_reader.py
+import sys
+from typing import Optional, Tuple, List
+import numpy as np
+from .i_frame_reader import IFrameReader
+from .pipe_frame_reader import PipeFrameReader
+from .file_frame_reader import FileFrameReader
+from .raw_video_dumper import RawVideoDumper
+
+class FallbackFrameReader(IFrameReader):
+    """
+    Birden fazla frame okuma stratejisini dener; ilk başarılı olanı kullanır.
+    """
+
+    def __init__(self, input_source: str, fps: int, resolution: Tuple[int, int],
+                 strategies: Optional[List[type]] = None):
+        """
+        :param strategies: Denecek strateji sınıflarının listesi (IFrameReader implementasyonu)
+                           Varsayılan: [PipeFrameReader, FileFrameReader]
+        """
+        self.input_source = input_source
+        self.fps = fps
+        self.resolution = resolution
+        self._reader: Optional[IFrameReader] = None
+        self._dumper: Optional[RawVideoDumper] = None   # FileFrameReader için gerekli
+        self._buffered_frame: Optional[np.ndarray] = None
+
+        if strategies is None:
+            strategies = [PipeFrameReader, FileFrameReader]
+
+        self._try_strategies(strategies)
+
+    def _try_strategies(self, strategy_classes: List[type]) -> None:
+        for strategy_cls in strategy_classes:
+            try:
+                if strategy_cls == FileFrameReader:
+                    # FileFrameReader önce ham dosyaya dönüştürmeyi gerektirir
+                    self._dumper = RawVideoDumper(self.input_source, self.fps, self.resolution)
+                    raw_path = self._dumper.dump()
+                    self._reader = FileFrameReader(raw_path)
+                    self._buffered_frame = None
+                else:
+                    # PipeFrameReader veya diğer doğrudan stratejiler
+                    self._reader = strategy_cls(self.input_source, self.fps, self.resolution)
+                    first_frame = self._reader.read_frame()
+                    if first_frame is None:
+                        raise IOError("İlk frame alınamadı")
+                    self._buffered_frame = first_frame
+                # Başarılı olduysa döngüden çık
+                return
+            except Exception as e:
+                print(f"Strateji {strategy_cls.__name__} başarısız: {e}", file=sys.stderr)
+                self._cleanup()
+        # Tüm stratejiler başarısız
+        raise RuntimeError("Hiçbir frame okuma stratejisi çalışmadı.")
+
+    def _cleanup(self):
+        if self._reader:
+            self._reader.release()
+            self._reader = None
+        if self._dumper:
+            self._dumper.cleanup()
+            self._dumper = None
+        self._buffered_frame = None
+
+    def read_frame(self) -> Optional[np.ndarray]:
+        if self._buffered_frame is not None:
+            frame = self._buffered_frame
+            self._buffered_frame = None
+            return frame
+        if self._reader is None:
+            return None
+        return self._reader.read_frame()
+
+    def release(self):
+        self._cleanup()
+
+// === C://Users//BERAT//Desktop//video_to_ppt\infrastructure\frame_adapters\file_frame_reader.py ===
+
+import cv2
+import numpy as np
+from typing import Optional
+from .i_frame_reader import IFrameReader
+
+class FileFrameReader(IFrameReader):
+    """
+    OpenCV kullanarak bir video dosyasından (raw veya sıkıştırılmış) frame okur.
+    """
+
+    def __init__(self, file_path: str):
+        self.file_path = file_path
+        self.cap = cv2.VideoCapture(file_path)
+        if not self.cap.isOpened():
+            raise IOError(f"Video dosyası açılamadı: {file_path}")
+
+    def read_frame(self) -> Optional[np.ndarray]:
+        if self.cap is None:
+            return None
+        ret, frame = self.cap.read()
+        if not ret:
+            return None
+        return frame
+
+    def release(self):
+        if self.cap:
+            self.cap.release()
+            self.cap = None
+
+// === C://Users//BERAT//Desktop//video_to_ppt\infrastructure\frame_adapters\i_frame_reader.py ===
+
+from abc import ABC, abstractmethod
+from typing import Optional
+import numpy as np
+
+class IFrameReader(ABC):
+    """Ham frame okuyucuları için ortak arayüz."""
+
+    @abstractmethod
+    def read_frame(self) -> Optional[np.ndarray]:
+        """Sonraki frame'i (BGR numpy array) döndürür, bitince None."""
+        pass
+
+    @abstractmethod
+    def release(self) -> None:
+        """Kaynakları serbest bırakır."""
+        pass
+
+// === C://Users//BERAT//Desktop//video_to_ppt\infrastructure\frame_adapters\pipe_frame_reader.py ===
+
+import subprocess as sp
+import numpy as np
+from typing import Optional, Tuple
+from .i_frame_reader import IFrameReader
+from config.settings import FFMPEG_BUFFER_SIZE, FFMPEG_LOGLEVEL
+
+
+class PipeFrameReader(IFrameReader):
+    def __init__(self, input_source: str, fps: int, resolution: Tuple[int, int], buffer_size: int = FFMPEG_BUFFER_SIZE):
+        self.input_source = input_source
+        self.fps = fps
+        self.width, self.height = resolution
+        self.proc = None
+        self._frame_size = self.width * self.height * 3
+        self._open()
+
+    def _open(self):
+        cmd = [
+            'ffmpeg',  # Adım 7'de dinamik yol eklenecek
+            '-i', self.input_source,
+            '-f', 'rawvideo',
+            '-pix_fmt', 'bgr24',
+            '-r', str(self.fps),
+            '-s', f'{self.width}x{self.height}',
+            '-an',
+            '-loglevel', FFMPEG_LOGLEVEL,
+            '-'
+        ]
+        # stderr'i yok sayarak buffer dolmasını engelle
+        self.proc = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.DEVNULL, bufsize=self._frame_size * 2)
+
+    def read_frame(self) -> Optional[np.ndarray]:
+        if self.proc is None or self.proc.stdout is None:
+            return None
+        raw = self.proc.stdout.read(self._frame_size)
+        if len(raw) != self._frame_size:
+            return None
+        frame = np.frombuffer(raw, dtype=np.uint8).reshape((self.height, self.width, 3))
+        return frame
+
+    def release(self):
+        if self.proc:
+            self.proc.terminate()
+            self.proc = None
+
+// === C://Users//BERAT//Desktop//video_to_ppt\infrastructure\frame_adapters\raw_video_dumper.py ===
+
+import subprocess as sp
+import tempfile
+import os
+from typing import Tuple
+
+
+class RawVideoDumper:
+    """
+    FFmpeg kullanarak bir videoyu ham BGR24 formatında geçici bir dosyaya yazar.
+    """
+
+    def __init__(self, input_source: str, fps: int, resolution: Tuple[int, int]):
+        self.input_source = input_source
+        self.fps = fps
+        self.resolution = resolution
+        self.temp_file = None
+
+    def dump(self) -> str:
+        """Videoyu ham formata dönüştürür ve geçici dosyanın yolunu döndürür."""
+        fd, path = tempfile.mkstemp(suffix='.raw')
+        os.close(fd)
+
+        width, height = self.resolution
+        cmd = [
+            'ffmpeg',
+            '-i', self.input_source,
+            '-f', 'rawvideo',
+            '-pix_fmt', 'bgr24',
+            '-r', str(self.fps),
+            '-s', f'{width}x{height}',
+            '-an',
+            '-y',
+            path
+        ]
+        try:
+            sp.run(cmd, check=True, capture_output=True, text=True)
+        except sp.CalledProcessError as e:
+            # Hata durumunda geçici dosyayı temizle
+            if os.path.exists(path):
+                os.unlink(path)
+            raise RuntimeError(
+                f"FFmpeg ham video dönüştürme hatası (kod {e.returncode}): {e.stderr}"
+            ) from e
+        except Exception as e:
+            if os.path.exists(path):
+                os.unlink(path)
+            raise RuntimeError(f"Beklenmeyen hata: {e}") from e
+
+        self.temp_file = path
+        return path
+
+    def cleanup(self):
+        if self.temp_file and os.path.exists(self.temp_file):
+            os.unlink(self.temp_file)
+            self.temp_file = None
+
+// === C://Users//BERAT//Desktop//video_to_ppt\infrastructure\frame_adapters\__init__.py ===
+
+from .i_frame_reader import IFrameReader
+from .pipe_frame_reader import PipeFrameReader
+from .file_frame_reader import FileFrameReader
+from .raw_video_dumper import RawVideoDumper
+from .fallback_frame_reader import FallbackFrameReader
+
+__all__ = [
+    "IFrameReader",
+    "PipeFrameReader",
+    "FileFrameReader",
+    "RawVideoDumper",
+    "FallbackFrameReader",
+]
+
+// === C://Users//BERAT//Desktop//video_to_ppt\strategies\__init__.py ===
+
+
+
+
+// === C://Users//BERAT//Desktop//video_to_ppt\strategies\frame_extraction\__init__.py ===
+
+
+
+
+// === C://Users//BERAT//Desktop//video_to_ppt\strategies\frame_sampling\every_frame_sampler.py ===
+
+from domain.i_frame_sampler import IFrameSampler
+import numpy as np
+from typing import Optional
+
+class EveryFrameSampler(IFrameSampler):
+    def should_sample(self, frame_index: int, frame: Optional[np.ndarray], current_time: float) -> bool:
+        return True
+
+    def reset(self) -> None:
+        pass
+
+// === C://Users//BERAT//Desktop//video_to_ppt\strategies\frame_sampling\time_based_sampler.py ===
+
+from domain.i_frame_sampler import IFrameSampler
+import numpy as np
+from typing import Optional
+
+class TimeBasedSampler(IFrameSampler):
+    def __init__(self, interval_sec: float = 1.0):
+        self.interval = interval_sec
+        self.last_sampled_time = -interval_sec   # başlangıçta ilk frame'i alabilmek için
+
+    def should_sample(self, frame_index: int, frame: Optional[np.ndarray], current_time: float) -> bool:
+        if current_time - self.last_sampled_time >= self.interval:
+            self.last_sampled_time = current_time
+            return True
+        return False
+
+    def reset(self) -> None:
+        self.last_sampled_time = -self.interval
+
+// === C://Users//BERAT//Desktop//video_to_ppt\strategies\frame_sampling\__init__.py ===
+
+from .every_frame_sampler import EveryFrameSampler
+from .time_based_sampler import TimeBasedSampler
+
+__all__ = ["EveryFrameSampler", "TimeBasedSampler"]
+
+// === C://Users//BERAT//Desktop//video_to_ppt\strategies\scene_detection\abs_diff_strategy.py ===
+
+import numpy as np
+from typing import Optional
+from domain.i_scene_detector import ISceneDetector
+from utils.image_utils import pixel_diff_ratio
+
+
+class AbsDiffStrategy(ISceneDetector):
+    def __init__(self, threshold: float = 0.3):
+        self.threshold = threshold
+
+    def is_scene_change(self, prev_frame: Optional[np.ndarray], curr_frame: np.ndarray) -> bool:
+        if prev_frame is None:
+            return True
+        if prev_frame.shape != curr_frame.shape:
+            return True
+        if np.array_equal(prev_frame, curr_frame):
+            return False
+        mean_diff = pixel_diff_ratio(prev_frame, curr_frame)
+        return mean_diff > self.threshold
+
+    def set_threshold(self, value: float) -> None:
+        self.threshold = max(0.0, min(1.0, value))
+
+// === C://Users//BERAT//Desktop//video_to_ppt\strategies\scene_detection\factory.py ===
+
+
+from domain.i_scene_detector import ISceneDetector
+from .abs_diff_strategy import AbsDiffStrategy
+
+class SceneDetectorFactory:
+    @staticmethod
+    def create(strategy_name: str = "absdiff", threshold: float = 0.3) -> ISceneDetector:
+        if strategy_name == "absdiff":
+            return AbsDiffStrategy(threshold)
+        # İleride yeni stratejiler eklenebilir
+        raise ValueError(f"Bilinmeyen strateji: {strategy_name}")
+
+// === C://Users//BERAT//Desktop//video_to_ppt\strategies\scene_detection\robust_diff_strategy.py ===
+
+import numpy as np
+from typing import Optional
+from domain.i_scene_detector import ISceneDetector
+from config.settings import DEFAULT_HIST_THRESHOLD, DEFAULT_PIXEL_THRESHOLD, DEFAULT_USE_HISTOGRAM
+from utils.image_utils import histogram_similarity, pixel_diff_ratio
+
+
+class RobustDiffStrategy(ISceneDetector):
+    def __init__(
+        self,
+        hist_threshold: float = DEFAULT_HIST_THRESHOLD,
+        pixel_threshold: float = DEFAULT_PIXEL_THRESHOLD,
+        use_histogram: bool = DEFAULT_USE_HISTOGRAM
+    ):
+        self.hist_threshold = hist_threshold
+        self.pixel_threshold = pixel_threshold
+        self.use_histogram = use_histogram
+
+    def is_scene_change(self, prev_frame: Optional[np.ndarray], curr_frame: np.ndarray) -> bool:
+        if prev_frame is None:
+            return True
+        if self.use_histogram:
+            hist_sim = histogram_similarity(prev_frame, curr_frame)
+            if hist_sim > self.hist_threshold:
+                return False
+        diff_ratio = pixel_diff_ratio(prev_frame, curr_frame)
+        return diff_ratio > self.pixel_threshold
+
+    def set_threshold(self, value: float) -> None:
+        self.pixel_threshold = max(0.0, min(1.0, value))
+
+// === C://Users//BERAT//Desktop//video_to_ppt\strategies\scene_detection\__init__.py ===
+
+
+from .abs_diff_strategy import AbsDiffStrategy
+from .factory import SceneDetectorFactory
+
+__all__ = ["AbsDiffStrategy", "SceneDetectorFactory"]
+
+// === C://Users//BERAT//Desktop//video_to_ppt\utils\ffmpeg_utils.py ===
+
+import os
+import shutil
+
+def get_ffmpeg_path() -> str:
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    local_ffmpeg = os.path.join(base_dir, "ffmpeg.exe")
+    if os.path.exists(local_ffmpeg):
+        return local_ffmpeg
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        return system_ffmpeg
+    raise RuntimeError("ffmpeg.exe bulunamadı. Lütfen proje klasörüne ffmpeg.exe koyun veya PATH'e ekleyin.")
+
+// === C://Users//BERAT//Desktop//video_to_ppt\utils\grid_utils.py ===
+
+import math
+
+def calculate_grid_dimensions(n: int) -> tuple:
+    if n <= 0:
+        return (0, 0)
+    cols = math.ceil(math.sqrt(n))
+    rows = math.ceil(n / cols)
+    return (rows, cols)
+
+// === C://Users//BERAT//Desktop//video_to_ppt\utils\image_utils.py ===
+
+"""
+Görüntü işleme yardımcı fonksiyonları.
+"""
+
+import cv2
+import numpy as np
+from PIL import Image
+
+
+def histogram_similarity(frame1: np.ndarray, frame2: np.ndarray) -> float:
+    """
+    İki frame'in renk histogramı benzerliğini hesaplar (0-1 arası, 1 en benzer).
+    """
+    hist1 = cv2.calcHist([frame1], [0, 1, 2], None, [16, 16, 16], [0, 256, 0, 256, 0, 256])
+    hist2 = cv2.calcHist([frame2], [0, 1, 2], None, [16, 16, 16], [0, 256, 0, 256, 0, 256])
+    hist1 = cv2.normalize(hist1, hist1).flatten()
+    hist2 = cv2.normalize(hist2, hist2).flatten()
+    return cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)
+
+
+def pixel_diff_ratio(frame1: np.ndarray, frame2: np.ndarray) -> float:
+    """
+    İki frame arasındaki ortalama piksel farkının normalize oranını döndürür (0-1).
+    """
+    diff = cv2.absdiff(frame1, frame2)
+    gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+    return np.mean(gray_diff) / 255.0
+
+
+def resize_image_to_max_width(image: np.ndarray, max_width: int) -> np.ndarray:
+    """
+    Görüntüyü genişliği max_width olacak şekilde yeniden boyutlandırır.
+    Oran korunur. Eğer genişlik zaten max_width'ten küçükse aynen döner.
+    """
+    height, width = image.shape[:2]
+    if width <= max_width:
+        return image
+    new_height = int(height * (max_width / width))
+    # OpenCV BGR -> RGB -> PIL -> resize -> BGR
+    rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    pil_img = Image.fromarray(rgb_image)
+    pil_img = pil_img.resize((max_width, new_height), Image.Resampling.LANCZOS)
+    return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+def pil_to_cv2(pil_img: Image.Image) -> np.ndarray:
+    rgb = np.array(pil_img.convert('RGB'))
+    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+// === C://Users//BERAT//Desktop//video_to_ppt\utils\settings_manager.py ===
+
+import json
+import os
+
+class SettingsManager:
+    SETTINGS_FILE = os.path.join(os.path.dirname(__file__), '..', 'user_settings.json')
+
+    @classmethod
+    def get_last_pptx_path(cls):
+        if os.path.exists(cls.SETTINGS_FILE):
+            with open(cls.SETTINGS_FILE, 'r') as f:
+                data = json.load(f)
+                return data.get('last_pptx_path', '')
+        return ''
+
+    @classmethod
+    def set_last_pptx_path(cls, path):
+        with open(cls.SETTINGS_FILE, 'w') as f:
+            json.dump({'last_pptx_path': path}, f)
+
+// === C://Users//BERAT//Desktop//video_to_ppt\utils\time_utils.py ===
+
+"""
+Zaman ile ilgili yardımcı fonksiyonlar.
+"""
+
+def format_timestamp(seconds: float, include_ms: bool = True) -> str:
+    """
+    Saniye cinsinden verilen süreyi MM:SS:mmm formatında döndürür.
+    Örnek: 125.5 -> "02:05:500"
+    """
+    minutes = int(seconds // 60)
+    secs = int(seconds % 60)
+    ms = int((seconds % 1) * 1000)
+    if include_ms:
+        return f"{minutes:02d}:{secs:02d}:{ms:03d}"
+    else:
+        return f"{minutes:02d}:{secs:02d}"
+
+// === C://Users//BERAT//Desktop//video_to_ppt\utils\url_resolver.py ===
+
+import yt_dlp
+from typing import Optional
+
+def resolve_video_url(youtube_url: str) -> Optional[str]:
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': False,
+        'forcejson': True,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        try:
+            info = ydl.extract_info(youtube_url, download=False)
+            formats = info.get('formats', [])
+            best = None
+            for f in formats:
+                if f.get('vcodec') != 'none' and f.get('url'):
+                    if best is None or f.get('height', 0) > best.get('height', 0):
+                        best = f
+            return best['url'] if best else None
+        except Exception:
+            return None
+
+// === C://Users//BERAT//Desktop//video_to_ppt\utils\__init__.py ===
+
+from .image_utils import histogram_similarity, pixel_diff_ratio, resize_image_to_max_width
+from .time_utils import format_timestamp
+
+__all__ = [
+    "histogram_similarity",
+    "pixel_diff_ratio",
+    "resize_image_to_max_width",
+    "format_timestamp",
+]
+
+// === C://Users//BERAT//Desktop//video_to_ppt\main.py ===
+
+
+from gui.main_window import MainWindow
+
+if __name__ == "__main__":
+    app = MainWindow()
+    app.mainloop()
+
+// === C://Users//BERAT//Desktop//video_to_ppt\config\di_container.py ===
+
+from infrastructure.video_downloader import VideoDownloader
+from infrastructure.local_video_stream import LocalVideoStream
+from infrastructure.pptx_slide_builder import PptxSlideBuilder
+from core.slideshow_generator import SlideshowGenerator
+from domain.i_progress_observer import IProgressObserver
+from strategies.frame_sampling.time_based_sampler import TimeBasedSampler
+from strategies.scene_detection.robust_diff_strategy import RobustDiffStrategy
+from config.settings import *
+import os
+from typing import Optional
+
+def create_generator_for_url(
+    url: str,
+    output_dir: str = ".",
+    observer: Optional[IProgressObserver] = None
+) -> SlideshowGenerator:
+    downloader = VideoDownloader()
+    try:
+        video_path = downloader.download(url)
+    except Exception as e:
+        if observer:
+            observer.on_error(url, str(e))
+        raise
+
+    title = url.split('v=')[-1][:20] if 'v=' in url else 'video'
+    video_stream = LocalVideoStream(video_path, target_fps=DEFAULT_FPS, target_width=DEFAULT_TARGET_WIDTH)
+    scene_detector = RobustDiffStrategy(
+        hist_threshold=DEFAULT_HIST_THRESHOLD,
+        pixel_threshold=DEFAULT_PIXEL_THRESHOLD,
+    )
+    output_path = os.path.join(output_dir, f"{title}.pptx")
+    slide_builder = PptxSlideBuilder(output_path, video_title=title, video_url=url)
+    frame_sampler = TimeBasedSampler(interval_sec=1.0)
+    
+    generator = SlideshowGenerator(
+        video_stream,
+        scene_detector,
+        slide_builder,
+        observer=observer,
+        min_slide_interval=MIN_SLIDE_INTERVAL_SEC,
+        frame_sampler=frame_sampler,
+        frame_queue_size=30,
+        add_first_slide_with_link=True,
+        temp_video_path=video_path,
+        downloader=downloader
+    )
+    return generator
+
+// === C://Users//BERAT//Desktop//video_to_ppt\config\settings.py ===
+
+"""
+Uygulama genelinde kullanılan sabitler ve yapılandırma değerleri.
+"""
+
+# Video işleme ayarları
+DEFAULT_FPS = 1                     # Saniyede 1 kare (çok hızlı)
+DEFAULT_TARGET_WIDTH = 640          # Daha küçük çözünürlük (hız ve bellek için)
+DEFAULT_IMAGE_QUALITY = 85
+MIN_SLIDE_INTERVAL_SEC = 0.5        # Minimum slayt aralığını biraz artır (gereksiz slaytları engeller)
+
+# Sahne tespiti varsayılanları (RobustDiffStrategy)
+DEFAULT_HIST_THRESHOLD = 0.999      # Histogram kullanmıyorsan değer önemsiz
+DEFAULT_PIXEL_THRESHOLD = 0.02      # Piksel farkı hassasiyeti (0.01 çok hassas, 0.03 daha az)
+DEFAULT_USE_HISTOGRAM = False       # Sadece piksel farkı kullan (daha hızlı)
+
+# AbsDiffStrategy için varsayılan
+DEFAULT_ABS_DIFF_THRESHOLD = 0.05
+
+# PPTX slayt düzeni sabitleri (inç cinsinden)
+SLIDE_IMAGE_LEFT_INCH = 1.0
+SLIDE_IMAGE_TOP_INCH = 1.5
+SLIDE_TEXT_LEFT_INCH = 1.0
+SLIDE_TEXT_TOP_INCH = 6.5
+SLIDE_TEXT_WIDTH_INCH = 8.0
+SLIDE_TEXT_HEIGHT_INCH = 1.0
+SLIDE_FONT_SIZE_TIMESTAMP = 14
+SLIDE_FONT_SIZE_TEXT = 18
+
+# Görüntü işleme
+JPEG_QUALITY = 85
+RESAMPLE_FILTER = "LANCZOS"  # PIL Resampling filter
+DPI = 96  # Varsayılan DPI (inç başına piksel)
+
+# FFmpeg
+FFMPEG_BUFFER_SIZE = 10 ** 8
+FFMPEG_LOGLEVEL = "error"
+
+# Yt-dlp
+YTDL_OPTS = {
+    'quiet': True,
+    'no_warnings': True,
+    'extract_flat': False,
+    'forcejson': True,
+    'compat_opts': ['ejs'],
+    'noplaylist': True,
+}
+
+// === C://Users//BERAT//Desktop//video_to_ppt\config\__init__.py ===
+
+
+
+
+// === C://Users//BERAT//Desktop//video_to_ppt\core\progress_notifier.py ===
+
+import queue
+from typing import Optional
+from domain.i_progress_observer import IProgressObserver
+
+class ProgressNotifier(IProgressObserver):
+    """Mesajları doğrudan verilen kuyruğa yazar."""
+
+    def __init__(self, target_queue: queue.Queue):
+        self._queue = target_queue
+
+    def on_progress(self, percent: float, message: str):
+        self._queue.put(('progress', percent, message))
+
+    def on_error(self, url: str, error_msg: str):
+        self._queue.put(('error', url, error_msg))
+
+    def on_finished(self, success_count: int, total_count: int):
+        self._queue.put(('finished', success_count, total_count))
+
+// === C://Users//BERAT//Desktop//video_to_ppt\core\slideshow_generator.py ===
+
+import time
+from typing import Optional
+from domain.i_video_stream import IVideoStream
+from domain.i_scene_detector import ISceneDetector
+from domain.i_slide_builder import ISlideBuilder
+from domain.i_progress_observer import IProgressObserver
+from domain.i_frame_sampler import IFrameSampler
+from strategies.frame_sampling.every_frame_sampler import EveryFrameSampler
+from config.settings import MIN_SLIDE_INTERVAL_SEC
+
+class SlideshowGenerator:
+    def __init__(
+        self,
+        video_stream: IVideoStream,
+        scene_detector: ISceneDetector,
+        slide_builder: ISlideBuilder,
+        observer: Optional[IProgressObserver] = None,
+        min_slide_interval: float = MIN_SLIDE_INTERVAL_SEC,
+        frame_sampler: Optional[IFrameSampler] = None,
+        frame_queue_size: int = 30,
+        add_first_slide_with_link: bool = False,
+        temp_video_path: str = None,
+        downloader=None
+    ):
+        self.video_stream = video_stream
+        self.scene_detector = scene_detector
+        self.slide_builder = slide_builder
+        self.observer = observer
+        self.min_slide_interval = min_slide_interval
+        self.frame_sampler = frame_sampler if frame_sampler else EveryFrameSampler()
+        self.add_first_slide_with_link = add_first_slide_with_link
+        self.temp_video_path = temp_video_path
+        self.downloader = downloader
+
+    def generate_slideshow(self) -> str:
+        video_info = self.video_stream.get_info()
+        duration = video_info.get('duration_seconds', 0)
+        title = video_info.get('title', 'Video')
+        fps = video_info.get('fps', 1)
+
+        self.frame_sampler.reset()
+        self._notify(0, "Video işleniyor...")
+
+        if self.add_first_slide_with_link:
+            self.slide_builder.create_new_slide()
+            video_url = getattr(self.video_stream, 'url', 'Bilinmiyor')
+            self.slide_builder.add_text(f"Video URL: {video_url}", font_size=18, bold=False)
+            self.slide_builder.add_timestamp(0, title)
+
+        prev_frame = None
+        frame_index = 0
+        scene_count = 0
+        last_slide_time = -self.min_slide_interval
+        start_time = time.time()
+
+        while True:
+            frame = self.video_stream.get_frame()
+            if frame is None:
+                break
+
+            current_sec = frame_index / fps
+            if self.frame_sampler.should_sample(frame_index, frame, current_sec):
+                if self.scene_detector.is_scene_change(prev_frame, frame):
+                    if (current_sec - last_slide_time) >= self.min_slide_interval:
+                        self.slide_builder.create_new_slide()
+                        self.slide_builder.add_image(frame)
+                        self.slide_builder.add_timestamp(current_sec, title)
+                        scene_count += 1
+                        last_slide_time = current_sec
+                prev_frame = frame
+
+            frame_index += 1
+            if frame_index % 30 == 0 and duration > 0:
+                percent = min(100.0, (frame_index / (duration * fps)) * 100.0)
+                self._notify(percent, f"İşleniyor... ({scene_count} slayt)")
+
+        elapsed = time.time() - start_time
+        self._notify(100, f"Tamamlandı! {scene_count} slayt, {elapsed:.1f} saniye")
+        return self.slide_builder.build()
+
+    def _notify(self, percent: float, message: str) -> None:
+        if self.observer:
+            self.observer.on_progress(percent, message)
+
+// === C://Users//BERAT//Desktop//video_to_ppt\core\__init__.py ===
+
+
+
+
+// === C://Users//BERAT//Desktop//video_to_ppt\domain\i_frame_sampler.py ===
+
+from abc import ABC, abstractmethod
+from typing import Optional
+import numpy as np
+
+class IFrameSampler(ABC):
+    """
+    Video akışından hangi frame'lerin işleneceğine karar veren strateji.
+    """
+    @abstractmethod
+    def should_sample(self, frame_index: int, frame: Optional[np.ndarray], current_time: float) -> bool:
+        """
+        Belirtilen frame'in işlenmesi gerekip gerekmediğini döndürür.
+        - frame_index: kaçıncı frame (0'dan başlar)
+        - frame: frame verisi (None olabilir)
+        - current_time: videoda geçen saniye
+        """
+        pass
+
+    @abstractmethod
+    def reset(self) -> None:
+        """Yeni video başlangıcında sıfırlama."""
+        pass
+
+// === C://Users//BERAT//Desktop//video_to_ppt\domain\i_grid_composer.py ===
+
+from abc import ABC, abstractmethod
+from typing import List
+from PIL import Image
+
+class IGridComposer(ABC):
+    @abstractmethod
+    def compose(self, images: List[Image.Image], rows: int, cols: int, margin: int = 10) -> Image.Image:
+        pass
+
+// === C://Users//BERAT//Desktop//video_to_ppt\domain\i_pptx_appender.py ===
+
+from abc import ABC, abstractmethod
+from PIL import Image
+
+class IPPTXAppender(ABC):
+    @abstractmethod
+    def append_image_as_slide(self, image: Image.Image, title: str = "Grid Slayt") -> str:
+        """Birleştirilmiş görseli yeni bir PPTX slaytı olarak ekler, dosya yolunu döndürür."""
+        pass
+
+// === C://Users//BERAT//Desktop//video_to_ppt\domain\i_pptx_reader.py ===
+
+from abc import ABC, abstractmethod
+from typing import List, Optional
+from PIL import Image
+
+class IPPTXReader(ABC):
+    @abstractmethod
+    def get_slide_count(self) -> int:
+        pass
+
+    @abstractmethod
+    def get_slide_images(self, slide_index: int) -> List[Image.Image]:
+        pass
+
+    @abstractmethod
+    def get_slide_text(self, slide_index: int) -> str:
+        """Slayttaki tüm metinleri döndürür (altbilgi dahil)."""
+        pass
+
+    @abstractmethod
+    def get_first_image_thumbnail(self, slide_index: int, max_size: int = 100) -> Optional[Image.Image]:
+        pass
+
+    @abstractmethod
+    def update_from_writer(self, writer) -> None:
+        pass
+
+    @abstractmethod
+    def close(self):
+        pass
+
+// === C://Users//BERAT//Desktop//video_to_ppt\domain\i_pptx_writer.py ===
+
+from abc import ABC, abstractmethod
+from typing import List
+from PIL import Image
+
+class IPPTXWriter(ABC):
+    @abstractmethod
+    def delete_slides(self, indices: List[int]) -> None:
+        pass
+
+    @abstractmethod
+    def rebuild_with_grid(self, selected_indices: List[int], grid_image: Image.Image) -> None:
+        pass
+
+    @abstractmethod
+    def replace_slide_image(self, slide_index: int, new_image: Image.Image) -> None:
+        """Belirtilen slayttaki ilk resmi yenisiyle değiştirir."""
+        pass
+
+    @abstractmethod
+    def save(self, path: str) -> None:
+        pass
+
+    @abstractmethod
+    def close(self):
+        pass
+
+// === C://Users//BERAT//Desktop//video_to_ppt\domain\i_progress_observer.py ===
+
+
+from abc import ABC, abstractmethod
+
+class IProgressObserver(ABC):
+    """GUI'ye ilerleme bildirimi yapmak için Observer arayüzü."""
+
+    @abstractmethod
+    def on_progress(self, percent: float, message: str) -> None:
+        """
+        percent: 0-100 arası ilerleme yüzdesi
+        message: Kullanıcıya gösterilecek bilgi metni (örn: "Sahne tespit ediliyor...")
+        """
+        pass
+
+    @abstractmethod
+    def on_error(self, url: str, error_msg: str) -> None:
+        """Bir URL işlenirken hata oluştuğunda çağrılır (çoklu URL senaryosu)."""
+        pass
+
+    @abstractmethod
+    def on_finished(self, success_count: int, total_count: int) -> None:
+        """Tüm işlemler bittiğinde çağrılır."""
+        pass
+
+// === C://Users//BERAT//Desktop//video_to_ppt\domain\i_scene_detector.py ===
+
+from abc import ABC, abstractmethod
+from typing import List, Optional
+import numpy as np
+
+class ISceneDetector(ABC):
+    """Sahne geçişi tespit stratejileri için arayüz."""
+
+    @abstractmethod
+    def is_scene_change(self, prev_frame: Optional[np.ndarray], curr_frame: np.ndarray) -> bool:
+        """
+        İki frame arasında anlamlı bir sahne değişimi olup olmadığını döndürür.
+        prev_frame = None ise ilk frame olarak kabul edilir (genellikle True döndürülür).
+        """
+        pass
+
+    @abstractmethod
+    def set_threshold(self, value: float) -> None:
+        """Duyarlılık eşik değerini ayarlar (0-1 arası, varsayılan 0.3 gibi)."""
+        pass
+
+// === C://Users//BERAT//Desktop//video_to_ppt\domain\i_slide_builder.py ===
+
+from abc import ABC, abstractmethod
+from typing import Any, Optional
+import numpy as np
+
+class ISlideBuilder(ABC):
+    @abstractmethod
+    def create_new_slide(self) -> None:
+        pass
+
+    @abstractmethod
+    def add_image(self, image: np.ndarray, max_width: int = 1024, quality: int = 85) -> None:
+        pass
+
+    @abstractmethod
+    def add_text(self, text: str, font_size: int = 18, bold: bool = False) -> None:
+        pass
+
+    @abstractmethod
+    def add_timestamp(self, seconds: float, video_title: str = "") -> None:
+        pass
+
+    @abstractmethod
+    def build(self) -> Any:
+        pass
+
+// === C://Users//BERAT//Desktop//video_to_ppt\domain\i_subtitle_provider.py ===
+
+from abc import ABC, abstractmethod
+from typing import List, Dict, Optional
+
+class ISubtitleProvider(ABC):
+    """
+    Altyazı sağlayıcısı arayüzü.
+    Bu sürümde kullanılmayacak, ancak Open/Closed prensibi gereği hazır tutulmaktadır.
+    Gelecekteki sürümlerde implemente edilebilir.
+    """
+
+    @abstractmethod
+    def fetch_subtitles(self, video_url: str, lang: str = "tr") -> Optional[List[Dict]]:
+        """
+        Video URL'sine ait altyazıları getirir.
+        Dönen liste: [{"start": float, "end": float, "text": str}, ...]
+        Başarısızsa None döner.
+        """
+        pass
+
+    @abstractmethod
+    def has_subtitles(self, video_url: str) -> bool:
+        """Videoda istenen dilde altyazı olup olmadığını kontrol eder."""
+        pass
+
+// === C://Users//BERAT//Desktop//video_to_ppt\domain\i_video_stream.py ===
+
+from abc import ABC, abstractmethod
+from typing import Optional, Dict
+import numpy as np
+
+class IVideoStream(ABC):
+    """Video akışından frame okuma ve meta bilgi alma arayüzü."""
+
+    @abstractmethod
+    def get_frame(self) -> Optional[np.ndarray]:
+        """
+        Bir sonraki frame'i (numpy array, BGR formatında) döndürür.
+        Akış sona erdiyse None döner.
+        """
+        pass
+
+    @abstractmethod
+    def get_info(self) -> Dict:
+        """
+        Video bilgilerini içeren sözlük döndürür.
+        Anahtarlar: 'title', 'duration_seconds', 'width', 'height', 'fps'
+        """
+        pass
+
+    @abstractmethod
+    def close(self) -> None:
+        """Akışla ilişkili kaynakları serbest bırakır."""
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+// === C://Users//BERAT//Desktop//video_to_ppt\domain\__init__.py ===
+
+# Domain katmanı soyutlamaları
+from .i_video_stream import IVideoStream
+from .i_scene_detector import ISceneDetector
+from .i_slide_builder import ISlideBuilder
+from .i_progress_observer import IProgressObserver
+from .i_subtitle_provider import ISubtitleProvider
+
+__all__ = [
+    "IVideoStream",
+    "ISceneDetector",
+    "ISlideBuilder",
+    "IProgressObserver",
+    "ISubtitleProvider",
+]
+
+// === C://Users//BERAT//Desktop//video_to_ppt\gui\conversion_controller.py ===
+
+import queue
+import threading
+from typing import List, Optional
+from core.slideshow_generator import SlideshowGenerator
+from core.progress_notifier import ProgressNotifier
+from config.di_container import create_generator_for_url
+
+class ConversionController:
+    def __init__(self, msg_queue: queue.Queue):
+        self.msg_queue = msg_queue
+        self.notifier = ProgressNotifier(msg_queue)
+        self._is_running = False
+        self._stop_requested = False
+        self._current_thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+
+    @property
+    def is_running(self) -> bool:
+        with self._lock:
+            return self._is_running
+
+    def start(self, url_list: List[str]) -> None:
+        with self._lock:
+            if self._is_running:
+                self.msg_queue.put(('error', None, "Zaten bir dönüştürme işlemi devam ediyor."))
+                return
+            if not url_list:
+                self.msg_queue.put(('error', None, "İşlenecek URL yok."))
+                return
+            self._is_running = True
+            self._stop_requested = False
+
+        self._current_thread = threading.Thread(
+            target=self._process_urls,
+            args=(url_list,),
+            daemon=True
+        )
+        self._current_thread.start()
+
+    def stop(self) -> None:
+        with self._lock:
+            self._stop_requested = True
+
+    def _process_urls(self, url_list: List[str]) -> None:
+        success_count = 0
+        errors = []
+        total = len(url_list)
+
+        for idx, url in enumerate(url_list):
+            with self._lock:
+                if self._stop_requested:
+                    self.msg_queue.put(('progress', 0, "İşlem kullanıcı tarafından durduruldu."))
+                    break
+
+            percent = int((idx / total) * 100)
+            self.msg_queue.put(('progress', percent, f"({idx+1}/{total}) İşleniyor: {url}"))
+
+            try:
+                generator = create_generator_for_url(url, observer=self.notifier)
+                pptx_path = generator.generate_slideshow()
+                self.msg_queue.put(('result', url, pptx_path))
+                self.msg_queue.put(('open_ppt_editor', pptx_path, generator.temp_video_path))
+                success_count += 1
+            except Exception as e:
+                error_msg = str(e)
+                self.msg_queue.put(('error', url, error_msg))
+                errors.append((url, error_msg))
+
+        with self._lock:
+            self._is_running = False
+
+        if errors and not self._stop_requested:
+            summary = f"{len(errors)} hata oluştu:\n" + "\n".join([f"{u}: {e}" for u, e in errors[:3]])
+            self.msg_queue.put(('messagebox', "Uyarı", summary))
+
+        self.msg_queue.put(('finished', success_count, total))
+
+// === C://Users//BERAT//Desktop//video_to_ppt\gui\main_window.py ===
+
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import queue
+from typing import List
+from gui.conversion_controller import ConversionController
+from gui.ppt_grid_editor_frame import PPTGridEditorFrame
+
+class MainWindow(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("YouTube2Slides - Video'dan Slayt ve PPT Düzenleme")
+        self.state('zoomed')
+        self.bind('<Escape>', lambda e: self._on_close())
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self.msg_queue = queue.Queue()
+        self.controller = ConversionController(self.msg_queue)
+
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+
+        self.conversion_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.conversion_tab, text="Video ➔ Slayt")
+
+        self.editor_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.editor_tab, text="PPT Düzenleme")
+        self.editor_frame = PPTGridEditorFrame(self.editor_tab, temp_video_path=None)
+        self.editor_frame.pack(fill=tk.BOTH, expand=True)
+
+        self._create_conversion_widgets()
+        self._poll_queue()
+
+    def _create_conversion_widgets(self):
+        tk.Label(self.conversion_tab, text="YouTube URL (tek veya satır satır):").pack(pady=5)
+        self.url_text = tk.Text(self.conversion_tab, height=8)
+        self.url_text.pack(fill=tk.BOTH, padx=10, pady=5, expand=True)
+
+        btn_frame = tk.Frame(self.conversion_tab)
+        btn_frame.pack(pady=5)
+        tk.Button(btn_frame, text="Listeyi Temizle", command=self._clear_urls).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="Dönüştürmeyi Başlat", command=self._start_conversion).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="Durdur", command=self._stop_conversion).pack(side=tk.LEFT, padx=5)
+
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(self.conversion_tab, variable=self.progress_var, maximum=100)
+        self.progress_bar.pack(fill=tk.X, padx=10, pady=10)
+
+        self.status_label = tk.Label(self.conversion_tab, text="Hazır", anchor="w")
+        self.status_label.pack(fill=tk.X, padx=10)
+
+        self.result_listbox = tk.Listbox(self.conversion_tab, height=8)
+        self.result_listbox.pack(fill=tk.BOTH, padx=10, pady=5, expand=True)
+
+    def _clear_urls(self):
+        self.url_text.delete(1.0, tk.END)
+
+    def _get_urls(self) -> List[str]:
+        raw = self.url_text.get(1.0, tk.END).strip().splitlines()
+        return [u.strip() for u in raw if u.strip()]
+
+    def _start_conversion(self):
+        urls = self._get_urls()
+        if not urls:
+            messagebox.showerror("Hata", "Lütfen en az bir URL girin.")
+            return
+        self.result_listbox.delete(0, tk.END)
+        self.progress_var.set(0)
+        self.status_label.config(text="İşlem başlatılıyor...")
+        self.controller.start(urls)
+
+    def _stop_conversion(self):
+        if self.controller.is_running:
+            self.controller.stop()
+            self.status_label.config(text="Durduruluyor...")
+        else:
+            messagebox.showinfo("Bilgi", "Devam eden işlem yok.")
+
+    def _poll_queue(self):
+        try:
+            while True:
+                msg = self.msg_queue.get_nowait()
+                self._handle_message(msg)
+        except queue.Empty:
+            pass
+        finally:
+            self.after(100, self._poll_queue)
+
+    def _handle_message(self, msg):
+        msg_type = msg[0]
+        if msg_type == 'progress':
+            _, percent, text = msg
+            self.progress_var.set(percent)
+            self.status_label.config(text=text)
+        elif msg_type == 'result':
+            _, url, pptx_path = msg
+            self.result_listbox.insert(tk.END, f"✔ BAŞARILI - {url} -> {pptx_path}")
+        elif msg_type == 'error':
+            _, url, err = msg
+            self.result_listbox.insert(tk.END, f"✘ HATA - {url}: {err}")
+        elif msg_type == 'messagebox':
+            _, title, text = msg
+            messagebox.showwarning(title, text)
+        elif msg_type == 'finished':
+            _, success, total = msg
+            self.status_label.config(text=f"İşlem tamamlandı. Başarılı: {success}/{total}")
+            if success == total:
+                messagebox.showinfo("Bitti", "Tüm videolar başarıyla dönüştürüldü.\nÇıktılar ana dizinde.")
+            else:
+                messagebox.showwarning("Bitti", f"{success}/{total} başarılı.\nHatalar için listeye bakın.")
+        elif msg_type == 'open_ppt_editor':
+            _, pptx_path, video_path = msg
+            self.notebook.select(self.editor_tab)
+            self.editor_frame.set_pptx_and_video(pptx_path, video_path)
+
+    def _on_close(self):
+        if self.controller.is_running:
+            if not messagebox.askokcancel("Çıkış", "İşlem devam ediyor. Çıkılsın mı?"):
+                return
+            self.controller.stop()
+        self.destroy()
+
+// === C://Users//BERAT//Desktop//video_to_ppt\gui\ppt_grid_controller.py ===
+
+from typing import List, Optional, Callable
+from PIL import Image
+from domain.i_pptx_reader import IPPTXReader
+from domain.i_pptx_writer import IPPTXWriter
+from domain.i_grid_composer import IGridComposer
+from utils.grid_utils import calculate_grid_dimensions
+from infrastructure.high_res_frame_extractor import HighResFrameExtractor
+from utils.url_resolver import resolve_video_url
+import re
+import cv2
+import numpy as np
+
+class PPTGridController:
+    def __init__(self, reader: IPPTXReader, writer: IPPTXWriter, composer: IGridComposer):
+        self.reader = reader
+        self.writer = writer
+        self.composer = composer
+
+    def get_slide_count(self) -> int:
+        return self.reader.get_slide_count()
+
+    def get_slide_preview(self, index: int, max_size: int = 100) -> Optional[Image.Image]:
+        return self.reader.get_first_image_thumbnail(index, max_size)
+
+    def delete_slides(self, selected_indices: List[int]) -> None:
+        if not selected_indices:
+            raise ValueError("Silinecek slayt seçilmedi")
+        self.writer.delete_slides(selected_indices)
+        self.reader.update_from_writer(self.writer)
+
+    def apply_grid(self, selected_indices: List[int], margin: int = 10) -> None:
+        if len(selected_indices) < 2:
+            raise ValueError("En az iki slayt seçmelisiniz")
+        images = []
+        for idx in selected_indices:
+            imgs = self.reader.get_slide_images(idx)
+            images.extend(imgs)
+        if not images:
+            raise ValueError("Seçilen slaytlarda hiç resim bulunamadı")
+        rows, cols = calculate_grid_dimensions(len(images))
+        grid_image = self.composer.compose(images, rows, cols, margin)
+        self.writer.rebuild_with_grid(selected_indices, grid_image)
+        self.reader.update_from_writer(self.writer)
+
+    def save(self, path: str) -> None:
+        self.writer.save(path)
+
+    def close(self):
+        self.reader.close()
+        self.writer.close()
+
+    def upgrade_slides(self, selected_indices: List[int], target_width: int = 1920, progress_callback: Optional[Callable[[int, int, int], None]] = None) -> None:
+        if not selected_indices:
+            raise ValueError("Yükseltilecek slayt seçilmedi")
+
+        first_slide_text = self.reader.get_slide_text(0)
+        youtube_url = self._extract_url_from_text(first_slide_text)
+        if not youtube_url:
+            raise ValueError("İlk slaytta video URL'si bulunamadı")
+
+        video_stream_url = resolve_video_url(youtube_url)
+        if not video_stream_url:
+            raise ValueError("Video akış URL'si alınamadı")
+
+        extractor = HighResFrameExtractor(video_stream_url)
+        total = len(selected_indices)
+        for i, idx in enumerate(selected_indices):
+            if progress_callback:
+                progress_callback(i, total, idx)
+            slide_text = self.reader.get_slide_text(idx)
+            seconds = self._extract_timestamp_from_text(slide_text)
+            if seconds is None:
+                continue
+            high_res_bgr = extractor.extract_frame(seconds, target_width=target_width)
+            if high_res_bgr is None:
+                continue
+            # numpy BGR'yi PIL RGB'ye çevir
+            high_res_rgb = cv2.cvtColor(high_res_bgr, cv2.COLOR_BGR2RGB)
+            high_res_pil = Image.fromarray(high_res_rgb)
+            self.writer.replace_slide_image(idx, high_res_pil)
+        self.reader.update_from_writer(self.writer)
+
+    def _extract_url_from_text(self, text: str) -> Optional[str]:
+        match = re.search(r'Video URL:\s*(https?://[^\s]+)', text)
+        return match.group(1) if match else None
+
+    def _extract_timestamp_from_text(self, text: str) -> Optional[float]:
+        match = re.search(r'(\d{2}):(\d{2}):(\d{3})', text)
+        if match:
+            minutes = int(match.group(1))
+            seconds = int(match.group(2))
+            ms = int(match.group(3))
+            return minutes * 60 + seconds + ms / 1000.0
+        return None
+
+// === C://Users//BERAT//Desktop//video_to_ppt\gui\ppt_grid_editor_frame.py ===
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import json
+import os
+import threading
+from PIL import ImageTk
+from infrastructure.python_pptx_reader import PythonPPTXReader
+from infrastructure.python_pptx_writer import PythonPPTXWriter
+from infrastructure.grid_composer import PillowGridComposer
+from gui.ppt_grid_controller import PPTGridController
+
+class PPTGridEditorFrame(ttk.Frame):
+    def __init__(self, parent, temp_video_path=None):
+        super().__init__(parent)
+        self.controller = None
+        self.thumbnails = []
+        self.selected_indices = []
+        self.settings_file = os.path.join(os.path.dirname(__file__), "..", "config", "ppt_grid_settings.json")
+        self.current_pptx_path = None
+        self.pptx_files = []
+        self.temp_video_path = temp_video_path
+        self._create_widgets()
+        self.load_last_working_directory()
+        self._bind_mousewheel()
+
+    def _bind_mousewheel(self):
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.canvas.bind_all("<Button-4>", self._on_mousewheel)
+        self.canvas.bind_all("<Button-5>", self._on_mousewheel)
+
+    def _on_mousewheel(self, event):
+        if event.num == 4 or (hasattr(event, 'delta') and event.delta > 0):
+            self.canvas.yview_scroll(-1, "units")
+        elif event.num == 5 or (hasattr(event, 'delta') and event.delta < 0):
+            self.canvas.yview_scroll(1, "units")
+        else:
+            self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+
+    def _create_widgets(self):
+        top_frame = ttk.Frame(self)
+        top_frame.pack(pady=5, fill=tk.X, padx=10)
+
+        ttk.Label(top_frame, text="Çalışma Klasörü:").pack(side=tk.LEFT, padx=5)
+        self.folder_path_var = tk.StringVar()
+        self.folder_entry = ttk.Entry(top_frame, textvariable=self.folder_path_var, width=40)
+        self.folder_entry.pack(side=tk.LEFT, padx=5)
+        ttk.Button(top_frame, text="Klasör Seç", command=self.browse_folder).pack(side=tk.LEFT)
+        ttk.Button(top_frame, text="Varsayılan Yap", command=self.set_as_default).pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(top_frame, text="Dosya Seç:").pack(side=tk.LEFT, padx=5)
+        self.file_combo = ttk.Combobox(top_frame, width=30, state="readonly")
+        self.file_combo.pack(side=tk.LEFT, padx=5)
+        self.file_combo.bind("<<ComboboxSelected>>", self.on_file_selected)
+
+        btn_frame = ttk.Frame(self)
+        btn_frame.pack(pady=10)
+        self.btn_delete = ttk.Button(btn_frame, text="Seçili Slaytları Sil", command=self.delete_selected)
+        self.btn_delete.pack(side=tk.LEFT, padx=10)
+        self.btn_grid = ttk.Button(btn_frame, text="Seçili Slaytları Grid Slaytta Birleştir", command=self.grid_selected)
+        self.btn_grid.pack(side=tk.LEFT, padx=10)
+        self.btn_upgrade = ttk.Button(btn_frame, text="Seçili Slaytları Yüksek Kaliteye Yükselt", command=self.upgrade_selected)
+        self.btn_upgrade.pack(side=tk.LEFT, padx=10)
+        self._disable_buttons()
+
+        frame_canvas = ttk.Frame(self)
+        frame_canvas.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        self.canvas = tk.Canvas(frame_canvas, bg='#f0f0f0')
+        scrollbar_y = ttk.Scrollbar(frame_canvas, orient=tk.VERTICAL, command=self.canvas.yview)
+        scrollbar_x = ttk.Scrollbar(frame_canvas, orient=tk.HORIZONTAL, command=self.canvas.xview)
+        self.canvas.configure(yscrollcommand=scrollbar_y.set, xscrollcommand=scrollbar_x.set)
+        scrollbar_y.pack(side=tk.RIGHT, fill=tk.Y)
+        scrollbar_x.pack(side=tk.BOTTOM, fill=tk.X)
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.inner = ttk.Frame(self.canvas)
+        self.canvas.create_window((0,0), window=self.inner, anchor="nw")
+        self.inner.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+
+        self.status_label = ttk.Label(self, text="", anchor="w")
+        self.status_label.pack(fill=tk.X, padx=10, pady=5)
+
+    def load_last_working_directory(self):
+        try:
+            with open(self.settings_file, "r") as f:
+                data = json.load(f)
+                folder = data.get("working_directory")
+                if folder and os.path.isdir(folder):
+                    self.folder_path_var.set(folder)
+                    self.refresh_pptx_list()
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+
+    def set_as_default(self):
+        folder = self.folder_path_var.get().strip()
+        if not folder or not os.path.isdir(folder):
+            messagebox.showerror("Hata", "Geçerli bir klasör seçin")
+            return
+        os.makedirs(os.path.dirname(self.settings_file), exist_ok=True)
+        with open(self.settings_file, "w") as f:
+            json.dump({"working_directory": folder}, f)
+        messagebox.showinfo("Başarılı", "Bu klasör varsayılan çalışma klasörü olarak kaydedildi.")
+
+    def browse_folder(self):
+        folder = filedialog.askdirectory(title="Çalışma Klasörünü Seçin")
+        if folder:
+            self.folder_path_var.set(folder)
+            self.refresh_pptx_list()
+
+    def refresh_pptx_list(self):
+        folder = self.folder_path_var.get().strip()
+        if not folder or not os.path.isdir(folder):
+            self.file_combo['values'] = []
+            return
+        files = [f for f in os.listdir(folder) if f.lower().endswith(".pptx")]
+        self.pptx_files = [(os.path.join(folder, f), f) for f in files]
+        self.file_combo['values'] = [f for _, f in self.pptx_files]
+        if self.pptx_files:
+            self.file_combo.current(0)
+            self.on_file_selected()
+        else:
+            self.file_combo.set("")
+            self.status_label.config(text="Klasörde PowerPoint dosyası bulunamadı")
+            self._disable_buttons()
+
+    def _disable_buttons(self):
+        self.btn_delete.config(state=tk.DISABLED)
+        self.btn_grid.config(state=tk.DISABLED)
+        self.btn_upgrade.config(state=tk.DISABLED)
+
+    def _enable_buttons(self):
+        self.btn_delete.config(state=tk.NORMAL)
+        self.btn_grid.config(state=tk.NORMAL)
+        self.btn_upgrade.config(state=tk.NORMAL)
+
+    def on_file_selected(self, event=None):
+        selection = self.file_combo.current()
+        if selection < 0 or selection >= len(self.pptx_files):
+            return
+        full_path = self.pptx_files[selection][0]
+        self.current_pptx_path = full_path
+        self.load_pptx(full_path)
+
+    def load_pptx(self, path):
+        try:
+            reader = PythonPPTXReader(path)
+            writer = PythonPPTXWriter(path)
+            composer = PillowGridComposer()
+            self.controller = PPTGridController(reader, writer, composer)
+            self.refresh_slides()
+            self._enable_buttons()
+            self.status_label.config(text=f"Yüklendi: {os.path.basename(path)}")
+        except Exception as e:
+            messagebox.showerror("Hata", f"Dosya açılamadı: {e}")
+            self._disable_buttons()
+
+    def refresh_slides(self):
+        for widget in self.inner.winfo_children():
+            widget.destroy()
+        self.thumbnails.clear()
+        self.selected_indices.clear()
+        count = self.controller.get_slide_count()
+        if count == 0:
+            ttk.Label(self.inner, text="Slayt yok").pack()
+            return
+        cols = 3
+        thumb_size = 220
+        for idx in range(count):
+            if idx % cols == 0:
+                row_frame = ttk.Frame(self.inner)
+                row_frame.pack(anchor="w", pady=10)
+            slide_frame = tk.Frame(row_frame, relief=tk.RIDGE, borderwidth=1, bg='white')
+            slide_frame.pack(side=tk.LEFT, padx=10, pady=5)
+
+            img = self.controller.get_slide_preview(idx, max_size=thumb_size)
+            photo = None
+            if img:
+                photo = ImageTk.PhotoImage(img)
+                label_img = tk.Label(slide_frame, image=photo, bg='white')
+                label_img.image = photo
+                label_img.pack(padx=2, pady=2)
+            else:
+                placeholder = tk.Label(slide_frame, text="[Resim yok]", width=25, height=15, bg='lightgray')
+                placeholder.pack()
+
+            lbl_num = tk.Label(slide_frame, text=f"Slayt {idx+1}", font=("Arial", 10, "bold"), bg='white')
+            lbl_num.pack()
+            var = tk.BooleanVar()
+            cb = ttk.Checkbutton(slide_frame, variable=var, text="Seç", command=lambda i=idx, v=var: self._toggle(i, v))
+            cb.pack()
+            self.thumbnails.append((photo, var, idx))
+
+        self.inner.update_idletasks()
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _toggle(self, idx, var):
+        if var.get():
+            if idx not in self.selected_indices:
+                self.selected_indices.append(idx)
+        else:
+            if idx in self.selected_indices:
+                self.selected_indices.remove(idx)
+
+    def delete_selected(self):
+        if not self.selected_indices:
+            messagebox.showerror("Hata", "Silinecek slayt seçin")
+            return
+        try:
+            self.status_label.config(text="Slaytlar siliniyor...")
+            self.update_idletasks()
+            self.controller.delete_slides(self.selected_indices)
+            self.controller.save(self.current_pptx_path)
+            self.status_label.config(text="Silme tamamlandı, slaytlar güncellendi.")
+            self.refresh_slides()
+        except Exception as e:
+            messagebox.showerror("Hata", str(e))
+            self.status_label.config(text="Hata oluştu")
+
+    def grid_selected(self):
+        if len(self.selected_indices) < 2:
+            messagebox.showerror("Hata", "En az iki slayt seçmelisiniz")
+            return
+        try:
+            self.status_label.config(text="Birleştiriliyor...")
+            self.update_idletasks()
+            self.controller.apply_grid(self.selected_indices, margin=10)
+            self.controller.save(self.current_pptx_path)
+            self.status_label.config(text="Birleştirme tamamlandı, slaytlar güncellendi.")
+            self.refresh_slides()
+        except Exception as e:
+            messagebox.showerror("Hata", str(e))
+            self.status_label.config(text="Hata oluştu")
+
+    def upgrade_selected(self):
+        if not self.selected_indices:
+            messagebox.showerror("Hata", "Yükseltilecek slayt seçin")
+            return
+        self.btn_upgrade.config(state=tk.DISABLED)
+        self.btn_grid.config(state=tk.DISABLED)
+        self.btn_delete.config(state=tk.DISABLED)
+
+        total = len(self.selected_indices)
+        self.status_label.config(text=f"Yüksek kaliteli kareler alınıyor (0/{total})...")
+        self.update_idletasks()
+
+        def task():
+            try:
+                def progress_callback(current, total, slide_idx):
+                    self.after(0, lambda: self.status_label.config(
+                        text=f"Yüksek kaliteli kareler alınıyor ({current+1}/{total}) - Slayt {slide_idx+1}..."
+                    ))
+                self.controller.upgrade_slides(self.selected_indices, target_width=1280, progress_callback=progress_callback)
+                self.controller.save(self.current_pptx_path)
+                self.after(0, self._upgrade_finished_success)
+            except Exception as e:
+                error_msg = str(e)
+                self.after(0, lambda: self._upgrade_finished_error(error_msg))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _upgrade_finished_success(self):
+        self.status_label.config(text="Yükseltme tamamlandı, slaytlar güncellendi.")
+        self.refresh_slides()
+        self._enable_buttons()
+        for _, var, _ in self.thumbnails:
+            var.set(False)
+        self.selected_indices.clear()
+        messagebox.showinfo("Tamamlandı", "Seçili slaytlar yüksek kaliteye yükseltildi.")
+
+    def _upgrade_finished_error(self, error_msg):
+        messagebox.showerror("Hata", f"Yükseltme sırasında hata:\n{error_msg}")
+        self.status_label.config(text="Hata oluştu")
+        self._enable_buttons()
+
+    def set_pptx_and_video(self, pptx_path, video_path):
+        self.temp_video_path = video_path
+        if pptx_path and os.path.exists(pptx_path):
+            self.current_pptx_path = pptx_path
+            folder = os.path.dirname(pptx_path)
+            self.folder_path_var.set(folder)
+            self.refresh_pptx_list()
+            for i, (fp, fn) in enumerate(self.pptx_files):
+                if fp == pptx_path:
+                    self.file_combo.current(i)
+                    self.on_file_selected()
+                    break
+
+// === C://Users//BERAT//Desktop//video_to_ppt\gui\ppt_grid_tool_window.py ===
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import json
+import os
+import threading
+from PIL import ImageTk
+from infrastructure.python_pptx_reader import PythonPPTXReader
+from infrastructure.python_pptx_writer import PythonPPTXWriter
+from infrastructure.grid_composer import PillowGridComposer
+from gui.ppt_grid_controller import PPTGridController
+
+class PPTGridToolWindow(tk.Toplevel):
+    def __init__(self, parent, default_pptx_path=None, temp_video_path=None):
+        super().__init__(parent)
+        self.title("PowerPoint Düzenleme Aracı")
+        self.geometry("1100x800")
+        self.controller = None
+        self.thumbnails = []
+        self.selected_indices = []
+        self.settings_file = os.path.join(os.path.dirname(__file__), "..", "config", "ppt_grid_settings.json")
+        self.current_pptx_path = None
+        self.pptx_files = []
+        self.temp_video_path = temp_video_path
+
+        self._create_widgets()
+        self.load_last_working_directory()
+        self._bind_mousewheel()
+
+        if default_pptx_path and os.path.exists(default_pptx_path):
+            self.current_pptx_path = default_pptx_path
+            self.load_pptx(default_pptx_path)
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close_cleanup)
+
+    def _on_close_cleanup(self):
+        if self.temp_video_path and os.path.exists(self.temp_video_path):
+            try:
+                os.unlink(self.temp_video_path)
+                print(f"[Cleanup] Geçici video silindi: {self.temp_video_path}")
+            except Exception as e:
+                print(f"[Cleanup] Video silinemedi: {e}")
+        self.destroy()
+
+    def _bind_mousewheel(self):
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.canvas.bind_all("<Button-4>", self._on_mousewheel)
+        self.canvas.bind_all("<Button-5>", self._on_mousewheel)
+
+    def _on_mousewheel(self, event):
+        if event.num == 4 or (hasattr(event, 'delta') and event.delta > 0):
+            self.canvas.yview_scroll(-1, "units")
+        elif event.num == 5 or (hasattr(event, 'delta') and event.delta < 0):
+            self.canvas.yview_scroll(1, "units")
+        else:
+            self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+
+    def _create_widgets(self):
+        top_frame = tk.Frame(self)
+        top_frame.pack(pady=5, fill=tk.X, padx=10)
+
+        tk.Label(top_frame, text="Çalışma Klasörü:").pack(side=tk.LEFT, padx=5)
+        self.folder_path_var = tk.StringVar()
+        self.folder_entry = tk.Entry(top_frame, textvariable=self.folder_path_var, width=40)
+        self.folder_entry.pack(side=tk.LEFT, padx=5)
+        tk.Button(top_frame, text="Klasör Seç", command=self.browse_folder).pack(side=tk.LEFT)
+        tk.Button(top_frame, text="Varsayılan Yap", command=self.set_as_default).pack(side=tk.LEFT, padx=5)
+
+        tk.Label(top_frame, text="Dosya Seç:").pack(side=tk.LEFT, padx=5)
+        self.file_combo = ttk.Combobox(top_frame, width=30, state="readonly")
+        self.file_combo.pack(side=tk.LEFT, padx=5)
+        self.file_combo.bind("<<ComboboxSelected>>", self.on_file_selected)
+
+        btn_frame = tk.Frame(self)
+        btn_frame.pack(pady=10)
+        self.btn_delete = tk.Button(btn_frame, text="Seçili Slaytları Sil", command=self.delete_selected, bg="#ff9999")
+        self.btn_delete.pack(side=tk.LEFT, padx=10)
+        self.btn_grid = tk.Button(btn_frame, text="Seçili Slaytları Grid Slaytta Birleştir", command=self.grid_selected, bg="#99ccff")
+        self.btn_grid.pack(side=tk.LEFT, padx=10)
+        self.btn_upgrade = tk.Button(btn_frame, text="Seçili Slaytları Yüksek Kaliteye Yükselt", command=self.upgrade_selected, bg="#aaffaa")
+        self.btn_upgrade.pack(side=tk.LEFT, padx=10)
+        self.btn_grid.config(state=tk.DISABLED)
+        self.btn_delete.config(state=tk.DISABLED)
+        self.btn_upgrade.config(state=tk.DISABLED)
+
+        frame_canvas = tk.Frame(self)
+        frame_canvas.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        self.canvas = tk.Canvas(frame_canvas)
+        scrollbar_y = tk.Scrollbar(frame_canvas, orient=tk.VERTICAL, command=self.canvas.yview)
+        scrollbar_x = tk.Scrollbar(frame_canvas, orient=tk.HORIZONTAL, command=self.canvas.xview)
+        self.canvas.configure(yscrollcommand=scrollbar_y.set, xscrollcommand=scrollbar_x.set)
+        scrollbar_y.pack(side=tk.RIGHT, fill=tk.Y)
+        scrollbar_x.pack(side=tk.BOTTOM, fill=tk.X)
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.inner = tk.Frame(self.canvas)
+        self.canvas.create_window((0,0), window=self.inner, anchor="nw")
+        self.inner.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+
+        self.status_label = tk.Label(self, text="", anchor="w")
+        self.status_label.pack(fill=tk.X, padx=10, pady=5)
+
+    def load_last_working_directory(self):
+        try:
+            with open(self.settings_file, "r") as f:
+                data = json.load(f)
+                folder = data.get("working_directory")
+                if folder and os.path.isdir(folder):
+                    self.folder_path_var.set(folder)
+                    self.refresh_pptx_list()
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+
+    def set_as_default(self):
+        folder = self.folder_path_var.get().strip()
+        if not folder or not os.path.isdir(folder):
+            messagebox.showerror("Hata", "Geçerli bir klasör seçin")
+            return
+        os.makedirs(os.path.dirname(self.settings_file), exist_ok=True)
+        with open(self.settings_file, "w") as f:
+            json.dump({"working_directory": folder}, f)
+        messagebox.showinfo("Başarılı", "Bu klasör varsayılan çalışma klasörü olarak kaydedildi.")
+
+    def browse_folder(self):
+        folder = filedialog.askdirectory(title="Çalışma Klasörünü Seçin")
+        if folder:
+            self.folder_path_var.set(folder)
+            self.refresh_pptx_list()
+
+    def refresh_pptx_list(self):
+        folder = self.folder_path_var.get().strip()
+        if not folder or not os.path.isdir(folder):
+            self.file_combo['values'] = []
+            self.status_label.config(text="Klasör geçerli değil")
+            return
+        files = [f for f in os.listdir(folder) if f.lower().endswith(".pptx")]
+        self.pptx_files = [(os.path.join(folder, f), f) for f in files]
+        self.file_combo['values'] = [f for _, f in self.pptx_files]
+        if self.pptx_files:
+            self.file_combo.current(0)
+            self.on_file_selected()
+        else:
+            self.file_combo.set("")
+            self.status_label.config(text="Klasörde PowerPoint dosyası bulunamadı")
+            self.btn_grid.config(state=tk.DISABLED)
+            self.btn_delete.config(state=tk.DISABLED)
+            self.btn_upgrade.config(state=tk.DISABLED)
+
+    def on_file_selected(self, event=None):
+        selection = self.file_combo.current()
+        if selection < 0 or selection >= len(self.pptx_files):
+            return
+        full_path = self.pptx_files[selection][0]
+        self.current_pptx_path = full_path
+        self.load_pptx(full_path)
+
+    def load_pptx(self, path):
+        try:
+            reader = PythonPPTXReader(path)
+            writer = PythonPPTXWriter(path)
+            composer = PillowGridComposer()
+            self.controller = PPTGridController(reader, writer, composer)
+            self.refresh_slides()
+            self.btn_grid.config(state=tk.NORMAL)
+            self.btn_delete.config(state=tk.NORMAL)
+            self.btn_upgrade.config(state=tk.NORMAL)
+            self.status_label.config(text=f"Yüklendi: {os.path.basename(path)}")
+        except Exception as e:
+            messagebox.showerror("Hata", f"Dosya açılamadı: {e}")
+            self.btn_grid.config(state=tk.DISABLED)
+            self.btn_delete.config(state=tk.DISABLED)
+            self.btn_upgrade.config(state=tk.DISABLED)
+
+    def refresh_slides(self):
+        for widget in self.inner.winfo_children():
+            widget.destroy()
+        self.thumbnails.clear()
+        self.selected_indices.clear()
+        count = self.controller.get_slide_count()
+        if count == 0:
+            tk.Label(self.inner, text="Slayt yok").pack()
+            return
+        cols = 3
+        thumb_size = 250
+        for idx in range(count):
+            if idx % cols == 0:
+                row_frame = tk.Frame(self.inner)
+                row_frame.pack(anchor="w", pady=10)
+            slide_frame = tk.Frame(row_frame, relief=tk.RIDGE, borderwidth=2, padx=5, pady=5)
+            slide_frame.pack(side=tk.LEFT, padx=10, pady=5)
+
+            img = self.controller.get_slide_preview(idx, max_size=thumb_size)
+            photo = None
+            if img:
+                photo = ImageTk.PhotoImage(img)
+                label_img = tk.Label(slide_frame, image=photo)
+                label_img.image = photo
+                label_img.pack()
+            else:
+                placeholder = tk.Label(slide_frame, text="[Resim yok]", width=30, height=20, bg='lightgray')
+                placeholder.pack()
+
+            lbl_num = tk.Label(slide_frame, text=f"Slayt {idx+1}", font=("Arial", 12, "bold"))
+            lbl_num.pack()
+            var = tk.BooleanVar()
+            cb = tk.Checkbutton(slide_frame, variable=var, text="Seç", font=("Arial", 10),
+                                command=lambda i=idx, v=var: self._toggle(i, v))
+            cb.pack()
+            self.thumbnails.append((photo, var, idx))
+
+        self.inner.update_idletasks()
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _toggle(self, idx, var):
+        if var.get():
+            if idx not in self.selected_indices:
+                self.selected_indices.append(idx)
+        else:
+            if idx in self.selected_indices:
+                self.selected_indices.remove(idx)
+
+    def delete_selected(self):
+        if not self.selected_indices:
+            messagebox.showerror("Hata", "Silinecek slayt seçin")
+            return
+        try:
+            self.status_label.config(text="Slaytlar siliniyor...")
+            self.update_idletasks()
+            self.controller.delete_slides(self.selected_indices)
+            self.controller.save(self.current_pptx_path)
+            self.status_label.config(text="Silme tamamlandı, slaytlar güncellendi.")
+            self.refresh_slides()
+        except Exception as e:
+            messagebox.showerror("Hata", str(e))
+            self.status_label.config(text="Hata oluştu")
+
+    def grid_selected(self):
+        if len(self.selected_indices) < 2:
+            messagebox.showerror("Hata", "En az iki slayt seçmelisiniz")
+            return
+        try:
+            self.status_label.config(text="Birleştiriliyor...")
+            self.update_idletasks()
+            self.controller.apply_grid(self.selected_indices, margin=10)
+            self.controller.save(self.current_pptx_path)
+            self.status_label.config(text="Birleştirme tamamlandı, slaytlar güncellendi.")
+            self.refresh_slides()
+        except Exception as e:
+            messagebox.showerror("Hata", str(e))
+            self.status_label.config(text="Hata oluştu")
+
+    def upgrade_selected(self):
+        if not self.selected_indices:
+            messagebox.showerror("Hata", "Yükseltilecek slayt seçin")
+            return
+
+        self.btn_upgrade.config(state=tk.DISABLED)
+        self.btn_grid.config(state=tk.DISABLED)
+        self.btn_delete.config(state=tk.DISABLED)
+
+        total = len(self.selected_indices)
+        self.status_label.config(text=f"Yüksek kaliteli kareler alınıyor (0/{total})...")
+        self.update_idletasks()
+
+        def task():
+            try:
+                def progress_callback(current, total, slide_idx):
+                    self.after(0, lambda: self.status_label.config(
+                        text=f"Yüksek kaliteli kareler alınıyor ({current+1}/{total}) - Slayt {slide_idx+1}..."
+                    ))
+                self.controller.upgrade_slides(self.selected_indices, target_width=1280, progress_callback=progress_callback)
+                self.controller.save(self.current_pptx_path)
+                self.after(0, self._upgrade_finished_success)
+            except Exception as e:
+                error_msg = str(e)
+                self.after(0, lambda: self._upgrade_finished_error(error_msg))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _upgrade_finished_success(self):
+        self.status_label.config(text="Yükseltme tamamlandı, slaytlar güncellendi.")
+        self.refresh_slides()
+        self.btn_upgrade.config(state=tk.NORMAL)
+        self.btn_grid.config(state=tk.NORMAL)
+        self.btn_delete.config(state=tk.NORMAL)
+        for _, var, _ in self.thumbnails:
+            var.set(False)
+        self.selected_indices.clear()
+        messagebox.showinfo("Tamamlandı", "Seçili slaytlar yüksek kaliteye yükseltildi.")
+
+    def _upgrade_finished_error(self, error_msg):
+        messagebox.showerror("Hata", f"Yükseltme sırasında hata:\n{error_msg}")
+        self.status_label.config(text="Hata oluştu")
+        self.btn_upgrade.config(state=tk.NORMAL)
+        self.btn_grid.config(state=tk.NORMAL)
+        self.btn_delete.config(state=tk.NORMAL)
+
+// === C://Users//BERAT//Desktop//video_to_ppt\gui\progress_bar.py ===
+
+import tkinter.ttk as ttk
+
+class ProgressBar:
+    def __init__(self, parent, max_value=100):
+        self.bar = ttk.Progressbar(parent, maximum=max_value)
+        self.bar.pack(fill='x', padx=10, pady=5)
+        
+    def set_value(self, value):
+        self.bar['value'] = value
+        
+    def set_max(self, value):
+        self.bar['maximum'] = value
+        
+    def pack(self, **kwargs):
+        self.bar.pack(**kwargs)
+
+
+// === C://Users//BERAT//Desktop//video_to_ppt\gui\subtitle_view.py ===
+
+
+
+
+// === C://Users//BERAT//Desktop//video_to_ppt\gui\__init__.py ===
+
+
+
+
+// === C://Users//BERAT//Desktop//video_to_ppt\infrastructure\grid_composer.py ===
+
+from PIL import Image
+from typing import List
+from domain.i_grid_composer import IGridComposer
+
+class PillowGridComposer(IGridComposer):
+    def compose(self, images: List[Image.Image], rows: int, cols: int, margin: int = 10) -> Image.Image:
+        if len(images) > rows * cols:
+            raise ValueError("Too many images for grid size")
+        max_w = max(img.width for img in images)
+        max_h = max(img.height for img in images)
+        processed = []
+        for img in images:
+            canvas = Image.new("RGB", (max_w, max_h), (255,255,255))
+            ratio = min(max_w/img.width, max_h/img.height)
+            new_w = int(img.width * ratio)
+            new_h = int(img.height * ratio)
+            img_resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+            x = (max_w - new_w) // 2
+            y = (max_h - new_h) // 2
+            canvas.paste(img_resized, (x, y))
+            processed.append(canvas)
+        grid_w = cols * max_w + (cols - 1) * margin
+        grid_h = rows * max_h + (rows - 1) * margin
+        grid = Image.new("RGB", (grid_w, grid_h), (255,255,255))
+        for idx, img in enumerate(processed):
+            row = idx // cols
+            col = idx % cols
+            x = col * (max_w + margin)
+            y = row * (max_h + margin)
+            grid.paste(img, (x, y))
+        return grid
+
+// === C://Users//BERAT//Desktop//video_to_ppt\infrastructure\high_res_frame_extractor.py ===
+
+import subprocess as sp
+import io
+import cv2
+import numpy as np
+from PIL import Image
+from typing import Optional
+from utils.ffmpeg_utils import get_ffmpeg_path
+
+class HighResFrameExtractor:
+    def __init__(self, video_url: str):
+        self.video_url = video_url
+        self.ffmpeg_path = get_ffmpeg_path()
+        print(f"[HighResFrameExtractor] URL: {video_url[:100]}...")
+
+    def extract_frame(self, seconds: float, target_width: int = 1920, timeout: int = 30) -> Optional[np.ndarray]:
+        print(f"[HighResFrameExtractor] Kare alınıyor: zaman={seconds:.3f} sn, genişlik={target_width}")
+        cmd = [
+            self.ffmpeg_path,
+            '-ss', str(seconds),
+            '-i', self.video_url,
+            '-frames:v', '1',
+            '-f', 'image2pipe',
+            '-vcodec', 'png',
+            '-vf', f'scale={target_width}:-2',
+            '-loglevel', 'error',
+            '-'
+        ]
+        try:
+            proc = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.PIPE)
+            stdout, stderr = proc.communicate(timeout=timeout)
+            if proc.returncode != 0 or len(stdout) == 0:
+                raise RuntimeError(f"Frame alınamadı: {stderr.decode()}")
+            img = Image.open(io.BytesIO(stdout))
+            rgb = np.array(img.convert('RGB'))
+            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            return bgr
+        except sp.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+            raise RuntimeError(f"FFmpeg işlemi {timeout} saniyede zaman aşımına uğradı: {stderr.decode()[:500]}")
+
+// === C://Users//BERAT//Desktop//video_to_ppt\infrastructure\local_video_stream.py ===
+
+import cv2
+import numpy as np
+from typing import Optional, Dict
+from domain.i_video_stream import IVideoStream
+
+class LocalVideoStream(IVideoStream):
+    def __init__(self, file_path: str, target_fps: int = 1, target_width: int = 640):
+        self.file_path = file_path
+        self.target_fps = target_fps
+        self.target_width = target_width
+        self.cap = cv2.VideoCapture(file_path)
+        if not self.cap.isOpened():
+            raise IOError(f"Video açılamadı: {file_path}")
+        self._orig_fps = self.cap.get(cv2.CAP_PROP_FPS)
+        if self._orig_fps <= 0:
+            raise IOError("Video FPS bilgisi alınamadı")
+        self._frame_interval = max(1, int(round(self._orig_fps / target_fps)))
+        self._frame_index = 0
+        self._total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    def get_frame(self) -> Optional[np.ndarray]:
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, self._frame_index)
+        ret, frame = self.cap.read()
+        if not ret:
+            return None
+        self._frame_index += self._frame_interval
+        if self.target_width and frame.shape[1] > self.target_width:
+            ratio = self.target_width / frame.shape[1]
+            new_h = int(frame.shape[0] * ratio)
+            frame = cv2.resize(frame, (self.target_width, new_h), interpolation=cv2.INTER_LANCZOS4)
+        return frame
+
+    def get_info(self) -> Dict:
+        duration = self._total_frames / self._orig_fps if self._orig_fps > 0 else 0
+        return {
+            'title': 'Video',
+            'duration_seconds': duration,
+            'width': self.target_width,
+            'height': 0,
+            'fps': self.target_fps,
+        }
+
+    def close(self):
+        if self.cap:
+            self.cap.release()
+
+// === C://Users//BERAT//Desktop//video_to_ppt\infrastructure\opencv_scene_detector.py ===
+
+
+
+
+// === C://Users//BERAT//Desktop//video_to_ppt\infrastructure\pptx_slide_builder.py ===
+
+import io
+import cv2
+import numpy as np
+from PIL import Image
+from pptx import Presentation
+from pptx.util import Inches, Pt
+from domain.i_slide_builder import ISlideBuilder
+from config.settings import (
+    DEFAULT_TARGET_WIDTH,
+    JPEG_QUALITY,
+    DPI,
+    SLIDE_IMAGE_LEFT_INCH,
+    SLIDE_IMAGE_TOP_INCH,
+    SLIDE_TEXT_LEFT_INCH,
+    SLIDE_TEXT_TOP_INCH,
+    SLIDE_TEXT_WIDTH_INCH,
+    SLIDE_TEXT_HEIGHT_INCH,
+    SLIDE_FONT_SIZE_TIMESTAMP,
+    SLIDE_FONT_SIZE_TEXT,
+)
+from utils.image_utils import resize_image_to_max_width
+from utils.time_utils import format_timestamp
+
+
+class PptxSlideBuilder(ISlideBuilder):
+    def __init__(self, output_path: str, video_title: str, video_url: str = ""):
+        self.output_path = output_path
+        self.video_title = video_title
+        self.video_url = video_url
+        self.prs = Presentation()
+        self.current_slide = None
+        self.slide_count = 0
+
+    def create_new_slide(self) -> None:
+        slide_layout = self.prs.slide_layouts[6]  # boş layout
+        self.current_slide = self.prs.slides.add_slide(slide_layout)
+        self.slide_count += 1
+
+    def add_image(
+        self,
+        image: np.ndarray,
+        max_width: int = DEFAULT_TARGET_WIDTH,
+        quality: int = JPEG_QUALITY,
+        vertical_align: str = "top"
+    ) -> None:
+        if self.current_slide is None:
+            self.create_new_slide()
+
+        resized_bgr = resize_image_to_max_width(image, max_width)
+        rgb_image = cv2.cvtColor(resized_bgr, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(rgb_image)
+
+        slide_width_emu = self.prs.slide_width
+        slide_height_emu = self.prs.slide_height
+        emu_per_inch = 914400
+        slide_width_inch = slide_width_emu / emu_per_inch
+        slide_height_inch = slide_height_emu / emu_per_inch
+
+        image_width_inch = pil_img.width / DPI
+        image_height_inch = pil_img.height / DPI
+
+        if image_width_inch > slide_width_inch:
+            scale = slide_width_inch / image_width_inch
+            new_width = int(pil_img.width * scale)
+            new_height = int(pil_img.height * scale)
+            pil_img = pil_img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            image_width_inch = new_width / DPI
+            image_height_inch = new_height / DPI
+
+        left_inch = (slide_width_inch - image_width_inch) / 2.0
+
+        if vertical_align == "center":
+            top_inch = (slide_height_inch - image_height_inch) / 2.0
+        elif vertical_align == "bottom":
+            top_inch = slide_height_inch - image_height_inch - 1.0
+            if top_inch < 0:
+                top_inch = 0
+        else:
+            top_inch = SLIDE_IMAGE_TOP_INCH
+
+        img_buffer = io.BytesIO()
+        pil_img.save(img_buffer, format='JPEG', quality=quality)
+        img_buffer.seek(0)
+
+        left = Inches(left_inch)
+        top = Inches(top_inch)
+        self.current_slide.shapes.add_picture(
+            img_buffer, left, top,
+            width=Inches(image_width_inch),
+            height=Inches(image_height_inch)
+        )
+
+    def add_text(self, text: str, font_size: int = SLIDE_FONT_SIZE_TEXT, bold: bool = False) -> None:
+        if self.current_slide is None:
+            self.create_new_slide()
+
+        left = Inches(SLIDE_TEXT_LEFT_INCH)
+        top = Inches(SLIDE_TEXT_TOP_INCH)
+        width = Inches(SLIDE_TEXT_WIDTH_INCH)
+        height = Inches(SLIDE_TEXT_HEIGHT_INCH)
+
+        textbox = self.current_slide.shapes.add_textbox(left, top, width, height)
+        text_frame = textbox.text_frame
+        text_frame.text = text
+        paragraph = text_frame.paragraphs[0]
+        paragraph.font.size = Pt(font_size)
+        paragraph.font.bold = bold
+
+    def add_timestamp(self, seconds: float, video_title: str = "") -> None:
+        timestamp_str = format_timestamp(seconds, include_ms=True)   # milisaniyeli
+        title_str = video_title if video_title else self.video_title
+        footer_text = f"{title_str} - {timestamp_str}"
+        self.add_text(footer_text, font_size=SLIDE_FONT_SIZE_TIMESTAMP, bold=False)
+
+    def build(self) -> str:
+        self.prs.save(self.output_path)
+        return self.output_path
+
+// === C://Users//BERAT//Desktop//video_to_ppt\infrastructure\python_pptx_reader.py ===
+
+import io
+from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE
+from PIL import Image
+from typing import List, Optional
+from domain.i_pptx_reader import IPPTXReader
+
+class PythonPPTXReader(IPPTXReader):
+    def __init__(self, file_path: str):
+        self.file_path = file_path
+        self.prs = Presentation(file_path)
+
+    def get_slide_count(self) -> int:
+        return len(self.prs.slides)
+
+    def get_slide_images(self, slide_index: int) -> List[Image.Image]:
+        images = []
+        slide = self.prs.slides[slide_index]
+        for shape in slide.shapes:
+            if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                blob = shape.image.blob
+                img = Image.open(io.BytesIO(blob))
+                images.append(img)
+        return images
+
+    def get_first_image_thumbnail(self, slide_index: int, max_size: int = 100) -> Optional[Image.Image]:
+        images = self.get_slide_images(slide_index)
+        if not images:
+            return None
+        img = images[0]
+        img.thumbnail((max_size, max_size))
+        return img
+
+    def update_from_writer(self, writer) -> None:
+        if hasattr(writer, '_new_prs') and writer._new_prs:
+            self.prs = writer._new_prs
+        elif hasattr(writer, 'last_saved_path') and writer.last_saved_path:
+            self.prs = Presentation(writer.last_saved_path)
+
+    def get_slide_text(self, slide_index: int) -> str:
+        slide = self.prs.slides[slide_index]
+        texts = []
+        for shape in slide.shapes:
+            if shape.has_text_frame:
+                texts.append(shape.text)
+        return "\n".join(texts)
+
+    def close(self):
+        pass
+
+// === C://Users//BERAT//Desktop//video_to_ppt\infrastructure\python_pptx_writer.py ===
+
+import io
+from pptx import Presentation
+from pptx.util import Inches
+from PIL import Image
+from typing import List
+from domain.i_pptx_writer import IPPTXWriter
+
+class PythonPPTXWriter(IPPTXWriter):
+    def __init__(self, source_path: str):
+        self.source_path = source_path
+        self._new_prs = None
+        self.last_saved_path = None
+
+    def rebuild_with_grid(self, selected_indices: List[int], grid_image: Image.Image) -> None:
+        prs = Presentation(self.source_path)
+        new_prs = Presentation()
+        blank_layout = new_prs.slide_layouts[6]
+
+        for idx, slide in enumerate(prs.slides):
+            if idx in selected_indices:
+                continue
+            new_slide = new_prs.slides.add_slide(blank_layout)
+            self._copy_slide_content(slide, new_slide)
+
+        insert_pos = min(selected_indices) if selected_indices else 0
+        slides_list = list(new_prs.slides)
+        final_prs = Presentation()
+        final_layout = final_prs.slide_layouts[6]
+
+        for i in range(insert_pos):
+            if i < len(slides_list):
+                self._copy_slide_content(slides_list[i], final_prs.slides.add_slide(final_layout))
+
+        grid_slide = final_prs.slides.add_slide(final_layout)
+        img_buffer = io.BytesIO()
+        grid_image.save(img_buffer, format='PNG')
+        img_buffer.seek(0)
+        left = Inches(1)
+        top = Inches(1)
+        width = Inches(8)
+        height = Inches(6)
+        grid_slide.shapes.add_picture(img_buffer, left, top, width, height)
+
+        for i in range(insert_pos, len(slides_list)):
+            self._copy_slide_content(slides_list[i], final_prs.slides.add_slide(final_layout))
+
+        self._new_prs = final_prs
+
+    def delete_slides(self, selected_indices: List[int]) -> None:
+        prs = Presentation(self.source_path)
+        new_prs = Presentation()
+        blank_layout = new_prs.slide_layouts[6]
+
+        for idx, slide in enumerate(prs.slides):
+            if idx in selected_indices:
+                continue
+            new_slide = new_prs.slides.add_slide(blank_layout)
+            self._copy_slide_content(slide, new_slide)
+
+        self._new_prs = new_prs
+
+    def replace_slide_image(self, slide_index: int, new_image: Image.Image) -> None:
+        prs = self._new_prs if self._new_prs else Presentation(self.source_path)
+        slide = prs.slides[slide_index]
+        picture_shape = None
+        for shape in slide.shapes:
+            if shape.shape_type == 13:  # picture
+                picture_shape = shape
+                break
+        if picture_shape is None:
+            raise ValueError(f"Slayt {slide_index} içinde resim bulunamadı")
+        left, top, width, height = picture_shape.left, picture_shape.top, picture_shape.width, picture_shape.height
+        picture_shape.element.getparent().remove(picture_shape.element)
+        img_buffer = io.BytesIO()
+        new_image.save(img_buffer, format='PNG')
+        img_buffer.seek(0)
+        slide.shapes.add_picture(img_buffer, left, top, width, height)
+        self._new_prs = prs
+
+    def save(self, path: str = None) -> None:
+        if path is None:
+            path = self.source_path
+        self.last_saved_path = path
+        if self._new_prs is None:
+            prs = Presentation(self.source_path)
+            prs.save(path)
+        else:
+            self._new_prs.save(path)
+
+    def _copy_slide_content(self, src_slide, dst_slide):
+        for shape in src_slide.shapes:
+            if shape.has_text_frame:
+                textbox = dst_slide.shapes.add_textbox(shape.left, shape.top, shape.width, shape.height)
+                textbox.text = shape.text
+            elif shape.shape_type == 13:  # picture
+                blob = shape.image.blob
+                dst_slide.shapes.add_picture(io.BytesIO(blob), shape.left, shape.top, shape.width, shape.height)
+
+    def close(self):
+        pass
+
+// === C://Users//BERAT//Desktop//video_to_ppt\infrastructure\video_downloader.py ===
+
+import yt_dlp
+import tempfile
+import os
+import time
+import shutil
+from utils.ffmpeg_utils import get_ffmpeg_path
+
+class VideoDownloader:
+    def __init__(self):
+        self.temp_file = None
+        self.ffmpeg_path = get_ffmpeg_path()
+
+    def download(self, url: str) -> str:
+        # En kararlı format sırası
+        format_options = [
+            'best[ext=mp4]',           # En iyi mp4
+            'bestvideo[ext=mp4]+bestaudio',  # Ayrı video+ses, birleştir
+            'best',                    # En iyi herhangi bir format
+        ]
+
+        last_exception = None
+        for fmt in format_options:
+            # Her format için yeni bir geçici dosya oluştur
+            fd, path = tempfile.mkstemp(suffix='.mp4')
+            os.close(fd)
+
+            ydl_opts = {
+                'format': fmt,
+                'outtmpl': path,
+                'ffmpeg_location': self.ffmpeg_path,
+                'quiet': False,
+                'no_warnings': False,
+                'progress_hooks': [self._progress_hook],
+                'retries': 10,
+                'fragment_retries': 10,
+                'merge_output_format': 'mp4',
+                'overwrites': True,      # Var olanı sil
+                'continuedl': False,     # Kaldığı yerden devam etme
+                'nooverwrites': False,
+            }
+
+            try:
+                print(f"[Download] Denenen format: {fmt}")
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
+
+                time.sleep(0.5)
+                if os.path.exists(path) and os.path.getsize(path) > 0:
+                    print(f"[Download] Başarılı: {path} ({os.path.getsize(path)} bytes)")
+                    self.temp_file = path
+                    # Diğer format denemelerinden kalan dosyaları temizle (varsa)
+                    # Burada sadece başarılı dosyayı döneceğiz
+                    return path
+                else:
+                    raise RuntimeError("Dosya boş oluştu")
+            except Exception as e:
+                last_exception = e
+                print(f"[Download] {fmt} formatı başarısız: {e}")
+                # Başarısız dosyayı sil
+                if os.path.exists(path):
+                    os.unlink(path)
+                continue
+
+        if last_exception:
+            raise RuntimeError(f"Video indirilemedi: {last_exception}")
+        else:
+            raise RuntimeError("Video indirilemedi: Bilinmeyen hata")
+
+    def _progress_hook(self, d):
+        if d['status'] == 'downloading':
+            if d.get('total_bytes'):
+                percent = d['downloaded_bytes'] / d['total_bytes'] * 100
+                print(f"\rİndirme: %{percent:.1f}", end='')
+        elif d['status'] == 'finished':
+            print("\nİndirme tamamlandı, işleniyor...")
+
+    def cleanup(self):
+        if self.temp_file and os.path.exists(self.temp_file):
+            os.unlink(self.temp_file)
+            self.temp_file = None
+
+// === C://Users//BERAT//Desktop//video_to_ppt\infrastructure\yt_dlp_stream.py ===
+
+import yt_dlp
+from typing import Optional, Tuple, Dict
+import numpy as np
+from domain.i_video_stream import IVideoStream
+from infrastructure.frame_adapters import FallbackFrameReader, IFrameReader
+from config.settings import DEFAULT_FPS, DEFAULT_TARGET_WIDTH, YTDL_OPTS
+
+
+class YtDlpVideoStream(IVideoStream):
+    """
+    YouTube (ve diğer yt-dlp destekli siteler) videolarını indirmeden,
+    frame'lerini sırayla okumayı sağlar.
+    """
+
+    def __init__(self, url: str, target_fps: int = DEFAULT_FPS, target_width: int = DEFAULT_TARGET_WIDTH):
+        self.url = url
+        self.target_fps = target_fps
+        self.target_width = target_width
+        self._video_info: Optional[Dict] = None
+        self._frame_reader: Optional[IFrameReader] = None
+        self._current_resolution: Tuple[int, int] = (0, 0)
+        self._init_video_info()
+        self._open_stream()
+
+    def _init_video_info(self):
+        with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
+            try:
+                info = ydl.extract_info(self.url, download=False)
+                self._video_info = info
+            except Exception as e:
+                raise RuntimeError(f"Video bilgisi alınamadı: {e}")
+
+    def _get_best_stream_url(self) -> str:
+        formats = self._video_info.get('formats', [])
+        if not formats:
+            raise RuntimeError("Video için hiç format bulunamadı.")
+        best_format = self._select_best_format(formats)
+        if best_format:
+            return best_format['url']
+        direct_url = self._video_info.get('url')
+        if direct_url:
+            return direct_url
+        raise RuntimeError("Hiçbir formattan video akış URL'si alınamadı.")
+
+    def _select_best_format(self, formats: list) -> Optional[Dict]:
+        best_format = None
+        best_score = -1.0
+        for f in formats:
+            if f.get('url') is None:
+                continue
+            if f.get('vcodec', 'none') == 'none':
+                continue
+            score = self._calculate_format_score(f)
+            if score > best_score:
+                best_score = score
+                best_format = f
+        return best_format
+
+    @staticmethod
+    def _calculate_format_score(f: Dict) -> float:
+        height = f.get('height', 0)
+        tbr = f.get('tbr', 0)
+        has_audio = 1 if f.get('acodec', 'none') != 'none' else 0
+        # Sesli formatlara 1000 puan bonus (çözünürlük ve bitrate ile karşılaştırılabilir)
+        audio_bonus = has_audio * 1000
+        return height + tbr / 1000 + audio_bonus
+
+    def _calculate_resolution(self) -> Tuple[int, int]:
+        width = self._video_info.get('width', 1920)
+        height = self._video_info.get('height', 1080)
+        if width <= self.target_width:
+            return width, height
+        ratio = self.target_width / width
+        new_width = self.target_width
+        new_height = int(height * ratio)
+        # FFmpeg için çift sayı yap
+        new_height = new_height if new_height % 2 == 0 else new_height + 1
+        return new_width, new_height
+
+    def _open_stream(self):
+        if self._frame_reader:
+            self._frame_reader.release()
+        video_url = self._get_best_stream_url()
+        width, height = self._calculate_resolution()
+        self._current_resolution = (width, height)
+        # Doğrudan PipeFrameReader kullan
+        from infrastructure.frame_adapters.pipe_frame_reader import PipeFrameReader
+        self._frame_reader = PipeFrameReader(video_url, self.target_fps, (width, height))
+
+    def get_frame(self) -> Optional[np.ndarray]:
+        if self._frame_reader is None:
+            return None
+        return self._frame_reader.read_frame()
+
+    def get_info(self) -> Dict:
+        if not self._video_info:
+            return {}
+        return {
+            'title': self._video_info.get('title', 'Unknown'),
+            'duration_seconds': self._video_info.get('duration', 0),
+            'width': self._current_resolution[0],
+            'height': self._current_resolution[1],
+            'fps': self.target_fps,
+        }
+
+    def close(self) -> None:
+        if self._frame_reader:
+            self._frame_reader.release()
+            self._frame_reader = None
+
+// === C://Users//BERAT//Desktop//video_to_ppt\infrastructure\yt_subtitle_provider.py ===
+
+
+
+
+// === C://Users//BERAT//Desktop//video_to_ppt\infrastructure\__init__.py ===
+
+
+
+
+// === C://Users//BERAT//Desktop//video_to_ppt\infrastructure\frame_adapters\fallback_frame_reader.py ===
+
+# infrastructure/frame_adapters/fallback_frame_reader.py
+import sys
+from typing import Optional, Tuple, List
+import numpy as np
+from .i_frame_reader import IFrameReader
+from .pipe_frame_reader import PipeFrameReader
+from .file_frame_reader import FileFrameReader
+from .raw_video_dumper import RawVideoDumper
+
+class FallbackFrameReader(IFrameReader):
+    """
+    Birden fazla frame okuma stratejisini dener; ilk başarılı olanı kullanır.
+    """
+
+    def __init__(self, input_source: str, fps: int, resolution: Tuple[int, int],
+                 strategies: Optional[List[type]] = None):
+        """
+        :param strategies: Denecek strateji sınıflarının listesi (IFrameReader implementasyonu)
+                           Varsayılan: [PipeFrameReader, FileFrameReader]
+        """
+        self.input_source = input_source
+        self.fps = fps
+        self.resolution = resolution
+        self._reader: Optional[IFrameReader] = None
+        self._dumper: Optional[RawVideoDumper] = None   # FileFrameReader için gerekli
+        self._buffered_frame: Optional[np.ndarray] = None
+
+        if strategies is None:
+            strategies = [PipeFrameReader, FileFrameReader]
+
+        self._try_strategies(strategies)
+
+    def _try_strategies(self, strategy_classes: List[type]) -> None:
+        for strategy_cls in strategy_classes:
+            try:
+                if strategy_cls == FileFrameReader:
+                    # FileFrameReader önce ham dosyaya dönüştürmeyi gerektirir
+                    self._dumper = RawVideoDumper(self.input_source, self.fps, self.resolution)
+                    raw_path = self._dumper.dump()
+                    self._reader = FileFrameReader(raw_path)
+                    self._buffered_frame = None
+                else:
+                    # PipeFrameReader veya diğer doğrudan stratejiler
+                    self._reader = strategy_cls(self.input_source, self.fps, self.resolution)
+                    first_frame = self._reader.read_frame()
+                    if first_frame is None:
+                        raise IOError("İlk frame alınamadı")
+                    self._buffered_frame = first_frame
+                # Başarılı olduysa döngüden çık
+                return
+            except Exception as e:
+                print(f"Strateji {strategy_cls.__name__} başarısız: {e}", file=sys.stderr)
+                self._cleanup()
+        # Tüm stratejiler başarısız
+        raise RuntimeError("Hiçbir frame okuma stratejisi çalışmadı.")
+
+    def _cleanup(self):
+        if self._reader:
+            self._reader.release()
+            self._reader = None
+        if self._dumper:
+            self._dumper.cleanup()
+            self._dumper = None
+        self._buffered_frame = None
+
+    def read_frame(self) -> Optional[np.ndarray]:
+        if self._buffered_frame is not None:
+            frame = self._buffered_frame
+            self._buffered_frame = None
+            return frame
+        if self._reader is None:
+            return None
+        return self._reader.read_frame()
+
+    def release(self):
+        self._cleanup()
+
+// === C://Users//BERAT//Desktop//video_to_ppt\infrastructure\frame_adapters\file_frame_reader.py ===
+
+import cv2
+import numpy as np
+from typing import Optional
+from .i_frame_reader import IFrameReader
+
+class FileFrameReader(IFrameReader):
+    """
+    OpenCV kullanarak bir video dosyasından (raw veya sıkıştırılmış) frame okur.
+    """
+
+    def __init__(self, file_path: str):
+        self.file_path = file_path
+        self.cap = cv2.VideoCapture(file_path)
+        if not self.cap.isOpened():
+            raise IOError(f"Video dosyası açılamadı: {file_path}")
+
+    def read_frame(self) -> Optional[np.ndarray]:
+        if self.cap is None:
+            return None
+        ret, frame = self.cap.read()
+        if not ret:
+            return None
+        return frame
+
+    def release(self):
+        if self.cap:
+            self.cap.release()
+            self.cap = None
+
+// === C://Users//BERAT//Desktop//video_to_ppt\infrastructure\frame_adapters\i_frame_reader.py ===
+
+from abc import ABC, abstractmethod
+from typing import Optional
+import numpy as np
+
+class IFrameReader(ABC):
+    """Ham frame okuyucuları için ortak arayüz."""
+
+    @abstractmethod
+    def read_frame(self) -> Optional[np.ndarray]:
+        """Sonraki frame'i (BGR numpy array) döndürür, bitince None."""
+        pass
+
+    @abstractmethod
+    def release(self) -> None:
+        """Kaynakları serbest bırakır."""
+        pass
+
+// === C://Users//BERAT//Desktop//video_to_ppt\infrastructure\frame_adapters\pipe_frame_reader.py ===
+
+import subprocess as sp
+import numpy as np
+from typing import Optional, Tuple
+from .i_frame_reader import IFrameReader
+from config.settings import FFMPEG_BUFFER_SIZE, FFMPEG_LOGLEVEL
+
+
+class PipeFrameReader(IFrameReader):
+    def __init__(self, input_source: str, fps: int, resolution: Tuple[int, int], buffer_size: int = FFMPEG_BUFFER_SIZE):
+        self.input_source = input_source
+        self.fps = fps
+        self.width, self.height = resolution
+        self.proc = None
+        self._frame_size = self.width * self.height * 3
+        self._open()
+
+    def _open(self):
+        cmd = [
+            'ffmpeg',  # Adım 7'de dinamik yol eklenecek
+            '-i', self.input_source,
+            '-f', 'rawvideo',
+            '-pix_fmt', 'bgr24',
+            '-r', str(self.fps),
+            '-s', f'{self.width}x{self.height}',
+            '-an',
+            '-loglevel', FFMPEG_LOGLEVEL,
+            '-'
+        ]
+        # stderr'i yok sayarak buffer dolmasını engelle
+        self.proc = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.DEVNULL, bufsize=self._frame_size * 2)
+
+    def read_frame(self) -> Optional[np.ndarray]:
+        if self.proc is None or self.proc.stdout is None:
+            return None
+        raw = self.proc.stdout.read(self._frame_size)
+        if len(raw) != self._frame_size:
+            return None
+        frame = np.frombuffer(raw, dtype=np.uint8).reshape((self.height, self.width, 3))
+        return frame
+
+    def release(self):
+        if self.proc:
+            self.proc.terminate()
+            self.proc = None
+
+// === C://Users//BERAT//Desktop//video_to_ppt\infrastructure\frame_adapters\raw_video_dumper.py ===
+
+import subprocess as sp
+import tempfile
+import os
+from typing import Tuple
+
+
+class RawVideoDumper:
+    """
+    FFmpeg kullanarak bir videoyu ham BGR24 formatında geçici bir dosyaya yazar.
+    """
+
+    def __init__(self, input_source: str, fps: int, resolution: Tuple[int, int]):
+        self.input_source = input_source
+        self.fps = fps
+        self.resolution = resolution
+        self.temp_file = None
+
+    def dump(self) -> str:
+        """Videoyu ham formata dönüştürür ve geçici dosyanın yolunu döndürür."""
+        fd, path = tempfile.mkstemp(suffix='.raw')
+        os.close(fd)
+
+        width, height = self.resolution
+        cmd = [
+            'ffmpeg',
+            '-i', self.input_source,
+            '-f', 'rawvideo',
+            '-pix_fmt', 'bgr24',
+            '-r', str(self.fps),
+            '-s', f'{width}x{height}',
+            '-an',
+            '-y',
+            path
+        ]
+        try:
+            sp.run(cmd, check=True, capture_output=True, text=True)
+        except sp.CalledProcessError as e:
+            # Hata durumunda geçici dosyayı temizle
+            if os.path.exists(path):
+                os.unlink(path)
+            raise RuntimeError(
+                f"FFmpeg ham video dönüştürme hatası (kod {e.returncode}): {e.stderr}"
+            ) from e
+        except Exception as e:
+            if os.path.exists(path):
+                os.unlink(path)
+            raise RuntimeError(f"Beklenmeyen hata: {e}") from e
+
+        self.temp_file = path
+        return path
+
+    def cleanup(self):
+        if self.temp_file and os.path.exists(self.temp_file):
+            os.unlink(self.temp_file)
+            self.temp_file = None
+
+// === C://Users//BERAT//Desktop//video_to_ppt\infrastructure\frame_adapters\__init__.py ===
+
+from .i_frame_reader import IFrameReader
+from .pipe_frame_reader import PipeFrameReader
+from .file_frame_reader import FileFrameReader
+from .raw_video_dumper import RawVideoDumper
+from .fallback_frame_reader import FallbackFrameReader
+
+__all__ = [
+    "IFrameReader",
+    "PipeFrameReader",
+    "FileFrameReader",
+    "RawVideoDumper",
+    "FallbackFrameReader",
+]
+
+// === C://Users//BERAT//Desktop//video_to_ppt\strategies\__init__.py ===
+
+
+
+
+// === C://Users//BERAT//Desktop//video_to_ppt\strategies\frame_extraction\__init__.py ===
+
+
+
+
+// === C://Users//BERAT//Desktop//video_to_ppt\strategies\frame_sampling\every_frame_sampler.py ===
+
+from domain.i_frame_sampler import IFrameSampler
+import numpy as np
+from typing import Optional
+
+class EveryFrameSampler(IFrameSampler):
+    def should_sample(self, frame_index: int, frame: Optional[np.ndarray], current_time: float) -> bool:
+        return True
+
+    def reset(self) -> None:
+        pass
+
+// === C://Users//BERAT//Desktop//video_to_ppt\strategies\frame_sampling\time_based_sampler.py ===
+
+from domain.i_frame_sampler import IFrameSampler
+import numpy as np
+from typing import Optional
+
+class TimeBasedSampler(IFrameSampler):
+    def __init__(self, interval_sec: float = 1.0):
+        self.interval = interval_sec
+        self.last_sampled_time = -interval_sec   # başlangıçta ilk frame'i alabilmek için
+
+    def should_sample(self, frame_index: int, frame: Optional[np.ndarray], current_time: float) -> bool:
+        if current_time - self.last_sampled_time >= self.interval:
+            self.last_sampled_time = current_time
+            return True
+        return False
+
+    def reset(self) -> None:
+        self.last_sampled_time = -self.interval
+
+// === C://Users//BERAT//Desktop//video_to_ppt\strategies\frame_sampling\__init__.py ===
+
+from .every_frame_sampler import EveryFrameSampler
+from .time_based_sampler import TimeBasedSampler
+
+__all__ = ["EveryFrameSampler", "TimeBasedSampler"]
+
+// === C://Users//BERAT//Desktop//video_to_ppt\strategies\scene_detection\abs_diff_strategy.py ===
+
+import numpy as np
+from typing import Optional
+from domain.i_scene_detector import ISceneDetector
+from utils.image_utils import pixel_diff_ratio
+
+
+class AbsDiffStrategy(ISceneDetector):
+    def __init__(self, threshold: float = 0.3):
+        self.threshold = threshold
+
+    def is_scene_change(self, prev_frame: Optional[np.ndarray], curr_frame: np.ndarray) -> bool:
+        if prev_frame is None:
+            return True
+        if prev_frame.shape != curr_frame.shape:
+            return True
+        if np.array_equal(prev_frame, curr_frame):
+            return False
+        mean_diff = pixel_diff_ratio(prev_frame, curr_frame)
+        return mean_diff > self.threshold
+
+    def set_threshold(self, value: float) -> None:
+        self.threshold = max(0.0, min(1.0, value))
+
+// === C://Users//BERAT//Desktop//video_to_ppt\strategies\scene_detection\factory.py ===
+
+
+from domain.i_scene_detector import ISceneDetector
+from .abs_diff_strategy import AbsDiffStrategy
+
+class SceneDetectorFactory:
+    @staticmethod
+    def create(strategy_name: str = "absdiff", threshold: float = 0.3) -> ISceneDetector:
+        if strategy_name == "absdiff":
+            return AbsDiffStrategy(threshold)
+        # İleride yeni stratejiler eklenebilir
+        raise ValueError(f"Bilinmeyen strateji: {strategy_name}")
+
+// === C://Users//BERAT//Desktop//video_to_ppt\strategies\scene_detection\robust_diff_strategy.py ===
+
+import numpy as np
+from typing import Optional
+from domain.i_scene_detector import ISceneDetector
+from config.settings import DEFAULT_HIST_THRESHOLD, DEFAULT_PIXEL_THRESHOLD, DEFAULT_USE_HISTOGRAM
+from utils.image_utils import histogram_similarity, pixel_diff_ratio
+
+
+class RobustDiffStrategy(ISceneDetector):
+    def __init__(
+        self,
+        hist_threshold: float = DEFAULT_HIST_THRESHOLD,
+        pixel_threshold: float = DEFAULT_PIXEL_THRESHOLD,
+        use_histogram: bool = DEFAULT_USE_HISTOGRAM
+    ):
+        self.hist_threshold = hist_threshold
+        self.pixel_threshold = pixel_threshold
+        self.use_histogram = use_histogram
+
+    def is_scene_change(self, prev_frame: Optional[np.ndarray], curr_frame: np.ndarray) -> bool:
+        if prev_frame is None:
+            return True
+        if self.use_histogram:
+            hist_sim = histogram_similarity(prev_frame, curr_frame)
+            if hist_sim > self.hist_threshold:
+                return False
+        diff_ratio = pixel_diff_ratio(prev_frame, curr_frame)
+        return diff_ratio > self.pixel_threshold
+
+    def set_threshold(self, value: float) -> None:
+        self.pixel_threshold = max(0.0, min(1.0, value))
+
+// === C://Users//BERAT//Desktop//video_to_ppt\strategies\scene_detection\__init__.py ===
+
+
+from .abs_diff_strategy import AbsDiffStrategy
+from .factory import SceneDetectorFactory
+
+__all__ = ["AbsDiffStrategy", "SceneDetectorFactory"]
+
+// === C://Users//BERAT//Desktop//video_to_ppt\utils\ffmpeg_utils.py ===
+
+import os
+import shutil
+
+def get_ffmpeg_path() -> str:
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    local_ffmpeg = os.path.join(base_dir, "ffmpeg.exe")
+    if os.path.exists(local_ffmpeg):
+        return local_ffmpeg
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        return system_ffmpeg
+    raise RuntimeError("ffmpeg.exe bulunamadı. Lütfen proje klasörüne ffmpeg.exe koyun veya PATH'e ekleyin.")
+
+// === C://Users//BERAT//Desktop//video_to_ppt\utils\grid_utils.py ===
+
+import math
+
+def calculate_grid_dimensions(n: int) -> tuple:
+    if n <= 0:
+        return (0, 0)
+    cols = math.ceil(math.sqrt(n))
+    rows = math.ceil(n / cols)
+    return (rows, cols)
+
+// === C://Users//BERAT//Desktop//video_to_ppt\utils\image_utils.py ===
+
+"""
+Görüntü işleme yardımcı fonksiyonları.
+"""
+
+import cv2
+import numpy as np
+from PIL import Image
+
+
+def histogram_similarity(frame1: np.ndarray, frame2: np.ndarray) -> float:
+    """
+    İki frame'in renk histogramı benzerliğini hesaplar (0-1 arası, 1 en benzer).
+    """
+    hist1 = cv2.calcHist([frame1], [0, 1, 2], None, [16, 16, 16], [0, 256, 0, 256, 0, 256])
+    hist2 = cv2.calcHist([frame2], [0, 1, 2], None, [16, 16, 16], [0, 256, 0, 256, 0, 256])
+    hist1 = cv2.normalize(hist1, hist1).flatten()
+    hist2 = cv2.normalize(hist2, hist2).flatten()
+    return cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)
+
+
+def pixel_diff_ratio(frame1: np.ndarray, frame2: np.ndarray) -> float:
+    """
+    İki frame arasındaki ortalama piksel farkının normalize oranını döndürür (0-1).
+    """
+    diff = cv2.absdiff(frame1, frame2)
+    gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+    return np.mean(gray_diff) / 255.0
+
+
+def resize_image_to_max_width(image: np.ndarray, max_width: int) -> np.ndarray:
+    """
+    Görüntüyü genişliği max_width olacak şekilde yeniden boyutlandırır.
+    Oran korunur. Eğer genişlik zaten max_width'ten küçükse aynen döner.
+    """
+    height, width = image.shape[:2]
+    if width <= max_width:
+        return image
+    new_height = int(height * (max_width / width))
+    # OpenCV BGR -> RGB -> PIL -> resize -> BGR
+    rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    pil_img = Image.fromarray(rgb_image)
+    pil_img = pil_img.resize((max_width, new_height), Image.Resampling.LANCZOS)
+    return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+def pil_to_cv2(pil_img: Image.Image) -> np.ndarray:
+    rgb = np.array(pil_img.convert('RGB'))
+    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+// === C://Users//BERAT//Desktop//video_to_ppt\utils\settings_manager.py ===
+
+import json
+import os
+
+class SettingsManager:
+    SETTINGS_FILE = os.path.join(os.path.dirname(__file__), '..', 'user_settings.json')
+
+    @classmethod
+    def get_last_pptx_path(cls):
+        if os.path.exists(cls.SETTINGS_FILE):
+            with open(cls.SETTINGS_FILE, 'r') as f:
+                data = json.load(f)
+                return data.get('last_pptx_path', '')
+        return ''
+
+    @classmethod
+    def set_last_pptx_path(cls, path):
+        with open(cls.SETTINGS_FILE, 'w') as f:
+            json.dump({'last_pptx_path': path}, f)
+
+// === C://Users//BERAT//Desktop//video_to_ppt\utils\time_utils.py ===
+
+"""
+Zaman ile ilgili yardımcı fonksiyonlar.
+"""
+
+def format_timestamp(seconds: float, include_ms: bool = True) -> str:
+    """
+    Saniye cinsinden verilen süreyi MM:SS:mmm formatında döndürür.
+    Örnek: 125.5 -> "02:05:500"
+    """
+    minutes = int(seconds // 60)
+    secs = int(seconds % 60)
+    ms = int((seconds % 1) * 1000)
+    if include_ms:
+        return f"{minutes:02d}:{secs:02d}:{ms:03d}"
+    else:
+        return f"{minutes:02d}:{secs:02d}"
+
+// === C://Users//BERAT//Desktop//video_to_ppt\utils\url_resolver.py ===
+
+import yt_dlp
+from typing import Optional
+
+def resolve_video_url(youtube_url: str) -> Optional[str]:
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': False,
+        'forcejson': True,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        try:
+            info = ydl.extract_info(youtube_url, download=False)
+            formats = info.get('formats', [])
+            best = None
+            for f in formats:
+                if f.get('vcodec') != 'none' and f.get('url'):
+                    if best is None or f.get('height', 0) > best.get('height', 0):
+                        best = f
+            return best['url'] if best else None
+        except Exception:
+            return None
+
+// === C://Users//BERAT//Desktop//video_to_ppt\utils\__init__.py ===
+
+from .image_utils import histogram_similarity, pixel_diff_ratio, resize_image_to_max_width
+from .time_utils import format_timestamp
+
+__all__ = [
+    "histogram_similarity",
+    "pixel_diff_ratio",
+    "resize_image_to_max_width",
+    "format_timestamp",
+]
