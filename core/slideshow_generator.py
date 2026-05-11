@@ -6,7 +6,7 @@ from domain.i_slide_builder import ISlideBuilder
 from domain.i_progress_reporter import IProgressReporter
 from domain.i_frame_sampler import IFrameSampler
 from strategies.frame_sampling.every_frame_sampler import EveryFrameSampler
-from config.settings import MIN_SLIDE_INTERVAL_SEC
+from config.settings import MIN_SLIDE_INTERVAL_SEC, PROGRESS_UPDATE_INTERVAL_FRAMES
 
 class SlideshowGenerator:
     def __init__(
@@ -48,7 +48,7 @@ class SlideshowGenerator:
 
         self._notify(100, f"Tamamlandı! {scene_count} slayt, {elapsed:.1f} saniye")
         return self.slide_builder.build()
-    
+
     def _add_first_slide(self, title: str) -> None:
         self.slide_builder.create_new_slide()
         video_url = getattr(self.video_stream, 'url', 'Bilinmiyor')
@@ -79,7 +79,7 @@ class SlideshowGenerator:
                 prev_frame = frame
 
             frame_index += 1
-            if frame_index % 30 == 0 and duration > 0:
+            if frame_index % PROGRESS_UPDATE_INTERVAL_FRAMES == 0 and duration > 0:
                 percent = min(100.0, (frame_index / (duration * fps)) * 100.0)
                 self._notify(percent, f"İşleniyor... ({scene_count} slayt)")
 

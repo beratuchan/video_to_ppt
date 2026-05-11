@@ -4,6 +4,7 @@ Uygulama genelinde kullanılan sabitler ve yapılandırma değerleri.
 
 # Video işleme ayarları
 DEFAULT_FPS = 1                     # Saniyede 1 kare (çok hızlı)
+TARGET_FPS = DEFAULT_FPS            # Takma ad (tutarlılık)
 DEFAULT_TARGET_WIDTH = 640          # Daha küçük çözünürlük (hız ve bellek için)
 DEFAULT_IMAGE_QUALITY = 85
 MIN_SLIDE_INTERVAL_SEC = 0.5        # Minimum slayt aralığını biraz artır (gereksiz slaytları engeller)
@@ -44,3 +45,19 @@ YTDL_OPTS = {
     'compat_opts': ['ejs'],
     'noplaylist': True,
 }
+
+# ========== YENİ SABİTLER (Clean Code) ==========
+# İlerleme ve zaman aşımı ayarları
+PROGRESS_UPDATE_INTERVAL_FRAMES = 30   # Her 30 frame'de bir ilerleme güncelle
+FRAME_EXTRACT_TIMEOUT_SEC = 30         # FFmpeg frame çekme zaman aşımı (saniye)
+MIN_FRAME_INTERVAL = 1                 # Minimum frame aralığı (FPS hesaplama)
+
+# GIF animasyonu varsayılanları
+DEFAULT_GIF_DURATION_PER_FRAME_SEC = 0.5  # Her karenin gösterim süresi
+DEFAULT_GIF_LOOP = 0                      # 0 = sonsuz döngü
+
+# Grid birleştirme varsayılanları
+DEFAULT_GRID_MARGIN_PX = 10
+
+# Video yükseltme (upgrade) varsayılanları
+DEFAULT_UPGRADE_TARGET_WIDTH = 1280

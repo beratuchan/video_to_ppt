@@ -4,6 +4,7 @@ from domain.i_pptx_reader import IPPTXReader
 from domain.i_pptx_writer import IPPTXWriter
 from domain.i_grid_composer import IGridComposer
 from utils.grid_utils import calculate_grid_dimensions
+from config.settings import DEFAULT_GRID_MARGIN_PX
 
 class GridComposerService:
     def __init__(self, reader: IPPTXReader, writer: IPPTXWriter, composer: IGridComposer):
@@ -11,7 +12,7 @@ class GridComposerService:
         self.writer = writer
         self.composer = composer
 
-    def apply_grid(self, selected_indices: List[int], margin: int = 10) -> None:
+    def apply_grid(self, selected_indices: List[int], margin: int = DEFAULT_GRID_MARGIN_PX) -> None:
         if len(selected_indices) < 2:
             raise ValueError("En az iki slayt seçmelisiniz")
         images = []

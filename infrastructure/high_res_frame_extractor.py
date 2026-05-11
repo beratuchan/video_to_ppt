@@ -5,6 +5,7 @@ import numpy as np
 from PIL import Image
 from typing import Optional
 from utils.ffmpeg_utils import get_ffmpeg_path
+from config.settings import FRAME_EXTRACT_TIMEOUT_SEC
 
 class HighResFrameExtractor:
     def __init__(self, video_url: str):
@@ -12,7 +13,7 @@ class HighResFrameExtractor:
         self.ffmpeg_path = get_ffmpeg_path()
         print(f"[HighResFrameExtractor] URL: {video_url[:100]}...")
 
-    def extract_frame(self, seconds: float, target_width: int = 1920, timeout: int = 30) -> Optional[np.ndarray]:
+    def extract_frame(self, seconds: float, target_width: int = 1920, timeout: int = FRAME_EXTRACT_TIMEOUT_SEC) -> Optional[np.ndarray]:
         print(f"[HighResFrameExtractor] Kare alınıyor: zaman={seconds:.3f} sn, genişlik={target_width}")
         cmd = [
             self.ffmpeg_path,

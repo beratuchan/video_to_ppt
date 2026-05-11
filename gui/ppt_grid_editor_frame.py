@@ -10,7 +10,7 @@ from infrastructure.grid_composer import PillowGridComposer
 from gui.ppt_grid_controller import PPTGridController
 from utils.url_resolver import resolve_video_url
 from infrastructure.high_res_frame_extractor import HighResFrameExtractor
-import threading
+from config.settings import DEFAULT_GRID_MARGIN_PX, DEFAULT_UPGRADE_TARGET_WIDTH
 
 class PPTGridEditorFrame(ttk.Frame):
     def __init__(self, parent, temp_video_path=None):
@@ -262,7 +262,7 @@ class PPTGridEditorFrame(ttk.Frame):
         try:
             self.status_label.config(text="Birleştiriliyor...")
             self.update_idletasks()
-            self.controller.apply_grid(self.selected_indices, margin=10)
+            self.controller.apply_grid(self.selected_indices, margin=DEFAULT_GRID_MARGIN_PX)
             self.controller.save(self.current_pptx_path)
             self.status_label.config(text="Birleştirme tamamlandı, slaytlar güncellendi.")
             self.refresh_slides()
@@ -283,7 +283,6 @@ class PPTGridEditorFrame(ttk.Frame):
         self.status_label.config(text=f"Yüksek kaliteli kareler alınıyor (0/{total})...")
         self.update_idletasks()
 
-        # İlk slayttan video URL'sini al
         youtube_url = self.controller.get_video_url_from_first_slide()
         if not youtube_url:
             messagebox.showerror("Hata", "İlk slaytta video URL'si bulunamadı")
@@ -302,7 +301,7 @@ class PPTGridEditorFrame(ttk.Frame):
                     self.after(0, lambda: self.status_label.config(
                         text=f"Yüksek kaliteli kareler alınıyor ({current+1}/{total}) - Slayt {slide_idx+1}..."
                     ))
-                self.controller.upgrade_slides(self.selected_indices, extractor, target_width=1280, progress_callback=progress_callback)
+                self.controller.upgrade_slides(self.selected_indices, extractor, target_width=DEFAULT_UPGRADE_TARGET_WIDTH, progress_callback=progress_callback)
                 self.controller.save(self.current_pptx_path)
                 self.after(0, self._upgrade_finished_success)
             except Exception as e:

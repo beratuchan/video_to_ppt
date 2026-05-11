@@ -68,6 +68,7 @@ Uygulama genelinde kullanılan sabitler ve yapılandırma değerleri.
 
 # Video işleme ayarları
 DEFAULT_FPS = 1                     # Saniyede 1 kare (çok hızlı)
+TARGET_FPS = DEFAULT_FPS            # Takma ad (tutarlılık)
 DEFAULT_TARGET_WIDTH = 640          # Daha küçük çözünürlük (hız ve bellek için)
 DEFAULT_IMAGE_QUALITY = 85
 MIN_SLIDE_INTERVAL_SEC = 0.5        # Minimum slayt aralığını biraz artır (gereksiz slaytları engeller)
@@ -108,6 +109,22 @@ YTDL_OPTS = {
     'compat_opts': ['ejs'],
     'noplaylist': True,
 }
+
+# ========== YENİ SABİTLER (Clean Code) ==========
+# İlerleme ve zaman aşımı ayarları
+PROGRESS_UPDATE_INTERVAL_FRAMES = 30   # Her 30 frame'de bir ilerleme güncelle
+FRAME_EXTRACT_TIMEOUT_SEC = 30         # FFmpeg frame çekme zaman aşımı (saniye)
+MIN_FRAME_INTERVAL = 1                 # Minimum frame aralığı (FPS hesaplama)
+
+# GIF animasyonu varsayılanları
+DEFAULT_GIF_DURATION_PER_FRAME_SEC = 0.5  # Her karenin gösterim süresi
+DEFAULT_GIF_LOOP = 0                      # 0 = sonsuz döngü
+
+# Grid birleştirme varsayılanları
+DEFAULT_GRID_MARGIN_PX = 10
+
+# Video yükseltme (upgrade) varsayılanları
+DEFAULT_UPGRADE_TARGET_WIDTH = 1280
 
 // === C://Users//BERAT//Desktop//video_to_ppt\config\__init__.py ===
 
@@ -209,7 +226,7 @@ from domain.i_slide_builder import ISlideBuilder
 from domain.i_progress_reporter import IProgressReporter
 from domain.i_frame_sampler import IFrameSampler
 from strategies.frame_sampling.every_frame_sampler import EveryFrameSampler
-from config.settings import MIN_SLIDE_INTERVAL_SEC
+from config.settings import MIN_SLIDE_INTERVAL_SEC, PROGRESS_UPDATE_INTERVAL_FRAMES
 
 class SlideshowGenerator:
     def __init__(
@@ -251,7 +268,7 @@ class SlideshowGenerator:
 
         self._notify(100, f"Tamamlandı! {scene_count} slayt, {elapsed:.1f} saniye")
         return self.slide_builder.build()
-    
+
     def _add_first_slide(self, title: str) -> None:
         self.slide_builder.create_new_slide()
         video_url = getattr(self.video_stream, 'url', 'Bilinmiyor')
@@ -282,7 +299,7 @@ class SlideshowGenerator:
                 prev_frame = frame
 
             frame_index += 1
-            if frame_index % 30 == 0 and duration > 0:
+            if frame_index % PROGRESS_UPDATE_INTERVAL_FRAMES == 0 and duration > 0:
                 percent = min(100.0, (frame_index / (duration * fps)) * 100.0)
                 self._notify(percent, f"İşleniyor... ({scene_count} slayt)")
 
@@ -362,6 +379,23 @@ class IFrameSampler(ABC):
     @abstractmethod
     def reset(self) -> None:
         """Yeni video başlangıcında sıfırlama."""
+        pass
+
+// === C://Users//BERAT//Desktop//video_to_ppt\domain\i_generator_factory.py ===
+
+from abc import ABC, abstractmethod
+from typing import Optional
+from core.slideshow_generator import SlideshowGenerator
+from domain.i_progress_reporter import IProgressReporter
+
+class IGeneratorFactory(ABC):
+    @abstractmethod
+    def create(
+        self,
+        url: str,
+        output_dir: str = ".",
+        observer: Optional[IProgressReporter] = None
+    ) -> SlideshowGenerator:
         pass
 
 // === C://Users//BERAT//Desktop//video_to_ppt\domain\i_grid_composer.py ===
@@ -590,23 +624,77 @@ __all__ = [
     "ISubtitleProvider",
 ]
 
+// === C://Users//BERAT//Desktop//video_to_ppt\factories\generator_factory.py ===
+
+from typing import Optional
+from core.slideshow_generator import SlideshowGenerator
+from domain.i_generator_factory import IGeneratorFactory
+from domain.i_progress_reporter import IProgressReporter
+from infrastructure.video_downloader import VideoDownloader
+from infrastructure.local_video_stream import LocalVideoStream
+from infrastructure.pptx_slide_builder import PptxSlideBuilder
+from strategies.frame_sampling.time_based_sampler import TimeBasedSampler
+from strategies.scene_detection.robust_diff_strategy import RobustDiffStrategy
+from config.settings import DEFAULT_FPS, DEFAULT_TARGET_WIDTH, MIN_SLIDE_INTERVAL_SEC, DEFAULT_HIST_THRESHOLD, DEFAULT_PIXEL_THRESHOLD
+import os
+
+class ConcreteGeneratorFactory(IGeneratorFactory):
+    def create(
+        self,
+        url: str,
+        output_dir: str = ".",
+        observer: Optional[IProgressReporter] = None
+    ) -> SlideshowGenerator:
+        downloader = VideoDownloader()
+        try:
+            video_path = downloader.download(url)
+        except Exception as e:
+            # Observer sadece IProgressReporter olduğu için on_error yok
+            # Hata yönetimi daha üst katmanda yapılacak
+            raise
+
+        title = url.split('v=')[-1][:20] if 'v=' in url else 'video'
+        video_stream = LocalVideoStream(video_path, target_fps=DEFAULT_FPS, target_width=DEFAULT_TARGET_WIDTH)
+        scene_detector = RobustDiffStrategy(
+            hist_threshold=DEFAULT_HIST_THRESHOLD,
+            pixel_threshold=DEFAULT_PIXEL_THRESHOLD,
+        )
+        output_path = os.path.join(output_dir, f"{title}.pptx")
+        slide_builder = PptxSlideBuilder(output_path, video_title=title, video_url=url)
+        frame_sampler = TimeBasedSampler(interval_sec=1.0)
+
+        generator = SlideshowGenerator(
+            video_stream,
+            scene_detector,
+            slide_builder,
+            observer=observer,
+            min_slide_interval=MIN_SLIDE_INTERVAL_SEC,
+            frame_sampler=frame_sampler,
+            frame_queue_size=30,
+            add_first_slide_with_link=True,
+            temp_video_path=video_path,
+            downloader=downloader
+        )
+        return generator
+
 // === C://Users//BERAT//Desktop//video_to_ppt\gui\conversion_controller.py ===
 
 import queue
-import threading
 from typing import List, Optional
 from core.slideshow_generator import SlideshowGenerator
 from core.progress_notifier import ProgressNotifier
 from core.background_task_executor import BackgroundTaskExecutor
 from core.message_dispatcher import MessageDispatcher
-from config.di_container import create_generator_for_url
+from domain.i_generator_factory import IGeneratorFactory
+from factories.generator_factory import ConcreteGeneratorFactory
 
 class ConversionController:
-    def __init__(self, msg_queue: queue.Queue):
+    def __init__(self, msg_queue: queue.Queue, factory: Optional[IGeneratorFactory] = None):
         self.msg_queue = msg_queue
         self.dispatcher = MessageDispatcher(msg_queue)
         self.notifier = ProgressNotifier(msg_queue)
         self.executor = BackgroundTaskExecutor()
+        self.factory = factory if factory else ConcreteGeneratorFactory()
 
     @property
     def is_running(self) -> bool:
@@ -638,7 +726,7 @@ class ConversionController:
             self.dispatcher.progress(percent, f"({idx+1}/{total}) İşleniyor: {url}")
 
             try:
-                generator = create_generator_for_url(url, observer=self.notifier)
+                generator = self.factory.create(url, observer=self.notifier)
                 pptx_path = generator.generate_slideshow()
                 self.dispatcher.result(url, pptx_path)
                 self.dispatcher.open_editor(pptx_path, generator.temp_video_path)
@@ -786,20 +874,18 @@ from domain.i_pptx_reader import IPPTXReader
 from domain.i_pptx_writer import IPPTXWriter
 from domain.i_grid_composer import IGridComposer
 from utils.grid_utils import calculate_grid_dimensions
-from infrastructure.high_res_frame_extractor import HighResFrameExtractor
-from utils.url_resolver import resolve_video_url
-import re
-import cv2
-import numpy as np
-import tempfile
-import os
+from services.slide_upgrader import SlideUpgrader
+from services.gif_animator import GifAnimator
+from services.grid_composer_service import GridComposerService
 from domain.i_frame_extractor import IFrameExtractor
+import re
 
 class PPTGridController:
     def __init__(self, reader: IPPTXReader, writer: IPPTXWriter, composer: IGridComposer):
         self.reader = reader
         self.writer = writer
         self.composer = composer
+        self.grid_service = GridComposerService(reader, writer, composer)
 
     def get_slide_count(self) -> int:
         return self.reader.get_slide_count()
@@ -814,18 +900,7 @@ class PPTGridController:
         self.reader.update_from_writer(self.writer)
 
     def apply_grid(self, selected_indices: List[int], margin: int = 10) -> None:
-        if len(selected_indices) < 2:
-            raise ValueError("En az iki slayt seçmelisiniz")
-        images = []
-        for idx in selected_indices:
-            imgs = self.reader.get_slide_images(idx)
-            images.extend(imgs)
-        if not images:
-            raise ValueError("Seçilen slaytlarda hiç resim bulunamadı")
-        rows, cols = calculate_grid_dimensions(len(images))
-        grid_image = self.composer.compose(images, rows, cols, margin)
-        self.writer.rebuild_with_grid(selected_indices, grid_image)
-        self.reader.update_from_writer(self.writer)
+        self.grid_service.apply_grid(selected_indices, margin)
 
     def save(self, path: str) -> None:
         self.writer.save(path)
@@ -835,93 +910,18 @@ class PPTGridController:
         self.writer.close()
 
     def upgrade_slides(self, selected_indices: List[int], extractor: IFrameExtractor, target_width: int = 1920, progress_callback: Optional[Callable[[int, int, int], None]] = None) -> None:
-        if not selected_indices:
-            raise ValueError("Yükseltilecek slayt seçilmedi")
-        # video_url'yi ilk slayttan al, extractor zaten bu URL ile oluşturulmuş olmalı
-        total = len(selected_indices)
-        for i, idx in enumerate(selected_indices):
-            if progress_callback:
-                progress_callback(i, total, idx)
-            slide_text = self.reader.get_slide_text(idx)
-            seconds = self._extract_timestamp_from_text(slide_text)
-            if seconds is None:
-                continue
-            high_res_bgr = extractor.extract_frame(seconds, target_width=target_width)
-            if high_res_bgr is None:
-                continue
-            high_res_rgb = cv2.cvtColor(high_res_bgr, cv2.COLOR_BGR2RGB)
-            high_res_pil = Image.fromarray(high_res_rgb)
-            self.writer.replace_slide_image(idx, high_res_pil)
-        self.reader.update_from_writer(self.writer)
+        SlideUpgrader.upgrade_slides(self.reader, self.writer, selected_indices, extractor, target_width, progress_callback)
 
-    # ----- Yeni GIF Stratejisi -----
     def replace_slides_with_gif(self, selected_indices: List[int], duration_per_frame: float = 0.5) -> None:
-        """
-        Seçili slaytlardaki ilk resimleri kullanarak bir GIF animasyonu oluşturur,
-        diğer slaytları siler ve GIF'i kalan slayta resim olarak ekler.
-        """
-        if len(selected_indices) < 2:
-            raise ValueError("En az iki slayt seçmelisiniz")
+        GifAnimator.replace_slides_with_gif(self.reader, self.writer, selected_indices, duration_per_frame)
 
-        # 1. Seçili slaytlardaki ilk resimleri topla (PIL Image)
-        images = []
-        for idx in selected_indices:
-            imgs = self.reader.get_slide_images(idx)
-            if imgs:
-                # İlk resmi al, RGB moduna çevir
-                img = imgs[0].convert('RGB')
-                images.append(img)
-        if not images:
-            raise ValueError("Seçilen slaytlarda hiç resim bulunamadı")
-
-        # 2. Geçici GIF dosyası oluştur
-        fd, gif_path = tempfile.mkstemp(suffix='.gif')
-        os.close(fd)
-        try:
-            duration_ms = int(duration_per_frame * 1000)
-            images[0].save(
-                gif_path,
-                save_all=True,
-                append_images=images[1:],
-                duration=duration_ms,
-                loop=0,           # sonsuz döngü
-                disposal=2
-            )
-
-            # 3. Diğer slaytları sil (sadece en küçük indeksli slayt kalacak)
-            min_idx = min(selected_indices)
-            other_indices = [idx for idx in selected_indices if idx != min_idx]
-            if other_indices:
-                self.writer.delete_slides(other_indices)
-
-            # 4. Kalan slaytın içeriğini tamamen temizle ve GIF'i ekle
-            self.writer.replace_slide_with_image(min_idx, gif_path)
-
-            # 5. Değişiklikleri kaydet
-            self.writer.save(self.writer.source_path)
-            self.reader.update_from_writer(self.writer)
-
-        finally:
-            if os.path.exists(gif_path):
-                os.unlink(gif_path)
-
-    # ----- Yardımcı Metodlar -----
-    def _extract_url_from_text(self, text: str) -> Optional[str]:
-        match = re.search(r'Video URL:\s*(https?://[^\s]+)', text)
-        return match.group(1) if match else None
-
-    def _extract_timestamp_from_text(self, text: str) -> Optional[float]:
-        match = re.search(r'(\d{2}):(\d{2}):(\d{3})', text)
-        if match:
-            minutes = int(match.group(1))
-            seconds = int(match.group(2))
-            ms = int(match.group(3))
-            return minutes * 60 + seconds + ms / 1000.0
-        return None
-    
     def get_video_url_from_first_slide(self) -> Optional[str]:
         first_slide_text = self.reader.get_slide_text(0)
         return self._extract_url_from_text(first_slide_text)
+
+    def _extract_url_from_text(self, text: str) -> Optional[str]:
+        match = re.search(r'Video URL:\s*(https?://[^\s]+)', text)
+        return match.group(1) if match else None
 
 // === C://Users//BERAT//Desktop//video_to_ppt\gui\ppt_grid_editor_frame.py ===
 
@@ -937,7 +937,7 @@ from infrastructure.grid_composer import PillowGridComposer
 from gui.ppt_grid_controller import PPTGridController
 from utils.url_resolver import resolve_video_url
 from infrastructure.high_res_frame_extractor import HighResFrameExtractor
-import threading
+from config.settings import DEFAULT_GRID_MARGIN_PX, DEFAULT_UPGRADE_TARGET_WIDTH
 
 class PPTGridEditorFrame(ttk.Frame):
     def __init__(self, parent, temp_video_path=None):
@@ -1189,7 +1189,7 @@ class PPTGridEditorFrame(ttk.Frame):
         try:
             self.status_label.config(text="Birleştiriliyor...")
             self.update_idletasks()
-            self.controller.apply_grid(self.selected_indices, margin=10)
+            self.controller.apply_grid(self.selected_indices, margin=DEFAULT_GRID_MARGIN_PX)
             self.controller.save(self.current_pptx_path)
             self.status_label.config(text="Birleştirme tamamlandı, slaytlar güncellendi.")
             self.refresh_slides()
@@ -1210,7 +1210,6 @@ class PPTGridEditorFrame(ttk.Frame):
         self.status_label.config(text=f"Yüksek kaliteli kareler alınıyor (0/{total})...")
         self.update_idletasks()
 
-        # İlk slayttan video URL'sini al
         youtube_url = self.controller.get_video_url_from_first_slide()
         if not youtube_url:
             messagebox.showerror("Hata", "İlk slaytta video URL'si bulunamadı")
@@ -1229,7 +1228,7 @@ class PPTGridEditorFrame(ttk.Frame):
                     self.after(0, lambda: self.status_label.config(
                         text=f"Yüksek kaliteli kareler alınıyor ({current+1}/{total}) - Slayt {slide_idx+1}..."
                     ))
-                self.controller.upgrade_slides(self.selected_indices, extractor, target_width=1280, progress_callback=progress_callback)
+                self.controller.upgrade_slides(self.selected_indices, extractor, target_width=DEFAULT_UPGRADE_TARGET_WIDTH, progress_callback=progress_callback)
                 self.controller.save(self.current_pptx_path)
                 self.after(0, self._upgrade_finished_success)
             except Exception as e:
@@ -1657,6 +1656,7 @@ import numpy as np
 from PIL import Image
 from typing import Optional
 from utils.ffmpeg_utils import get_ffmpeg_path
+from config.settings import FRAME_EXTRACT_TIMEOUT_SEC
 
 class HighResFrameExtractor:
     def __init__(self, video_url: str):
@@ -1664,7 +1664,7 @@ class HighResFrameExtractor:
         self.ffmpeg_path = get_ffmpeg_path()
         print(f"[HighResFrameExtractor] URL: {video_url[:100]}...")
 
-    def extract_frame(self, seconds: float, target_width: int = 1920, timeout: int = 30) -> Optional[np.ndarray]:
+    def extract_frame(self, seconds: float, target_width: int = 1920, timeout: int = FRAME_EXTRACT_TIMEOUT_SEC) -> Optional[np.ndarray]:
         print(f"[HighResFrameExtractor] Kare alınıyor: zaman={seconds:.3f} sn, genişlik={target_width}")
         cmd = [
             self.ffmpeg_path,
@@ -1720,6 +1720,7 @@ import cv2
 import numpy as np
 from typing import Optional, Dict
 from domain.i_video_stream import IVideoStream
+from config.settings import MIN_FRAME_INTERVAL
 
 class LocalVideoStream(IVideoStream):
     def __init__(self, file_path: str, target_fps: int = 1, target_width: int = 640):
@@ -1732,7 +1733,7 @@ class LocalVideoStream(IVideoStream):
         self._orig_fps = self.cap.get(cv2.CAP_PROP_FPS)
         if self._orig_fps <= 0:
             raise IOError("Video FPS bilgisi alınamadı")
-        self._frame_interval = max(1, int(round(self._orig_fps / target_fps)))
+        self._frame_interval = max(MIN_FRAME_INTERVAL, int(round(self._orig_fps / target_fps)))
         self._frame_index = 0
         self._total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
@@ -2529,6 +2530,177 @@ __all__ = [
     "RawVideoDumper",
     "FallbackFrameReader",
 ]
+
+// === C://Users//BERAT//Desktop//video_to_ppt\services\gif_animator.py ===
+
+import tempfile
+import os
+from typing import List
+from PIL import Image
+from domain.i_pptx_reader import IPPTXReader
+from domain.i_pptx_writer import IPPTXWriter
+from config.settings import DEFAULT_GIF_DURATION_PER_FRAME_SEC, DEFAULT_GIF_LOOP
+
+class GifAnimator:
+    @staticmethod
+    def replace_slides_with_gif(
+        reader: IPPTXReader,
+        writer: IPPTXWriter,
+        selected_indices: List[int],
+        duration_per_frame: float = DEFAULT_GIF_DURATION_PER_FRAME_SEC
+    ) -> None:
+        if len(selected_indices) < 2:
+            raise ValueError("En az iki slayt seçmelisiniz")
+
+        images = []
+        for idx in selected_indices:
+            imgs = reader.get_slide_images(idx)
+            if imgs:
+                img = imgs[0].convert('RGB')
+                images.append(img)
+        if not images:
+            raise ValueError("Seçilen slaytlarda hiç resim bulunamadı")
+
+        fd, gif_path = tempfile.mkstemp(suffix='.gif')
+        os.close(fd)
+        try:
+            duration_ms = int(duration_per_frame * 1000)
+            images[0].save(
+                gif_path,
+                save_all=True,
+                append_images=images[1:],
+                duration=duration_ms,
+                loop=DEFAULT_GIF_LOOP,
+                disposal=2  # disposal=2: arka planı temizle (her frame'de önceki silinir)
+            )
+
+            min_idx = min(selected_indices)
+            other_indices = [idx for idx in selected_indices if idx != min_idx]
+            if other_indices:
+                writer.delete_slides(other_indices)
+
+            writer.replace_slide_with_image(min_idx, gif_path)
+            writer.save(writer.source_path)
+            reader.update_from_writer(writer)
+        finally:
+            if os.path.exists(gif_path):
+                os.unlink(gif_path)
+
+// === C://Users//BERAT//Desktop//video_to_ppt\services\gif_creator.py ===
+
+from typing import List
+from PIL import Image
+import tempfile
+import os
+
+class GifCreator:
+    @staticmethod
+    def create_gif_from_images(images: List[Image.Image], duration_per_frame: float = 0.5) -> str:
+        """
+        Verilen PIL Image listesinden bir GIF dosyası oluşturur ve yolunu döndürür.
+        """
+        if len(images) < 2:
+            raise ValueError("En az iki görüntü gerekir")
+        
+        # Tüm görüntüleri RGB moduna çevir
+        rgb_images = [img.convert('RGB') for img in images]
+        
+        # Geçici GIF dosyası oluştur
+        fd, gif_path = tempfile.mkstemp(suffix='.gif')
+        os.close(fd)
+        
+        duration_ms = int(duration_per_frame * 1000)
+        rgb_images[0].save(
+            gif_path,
+            save_all=True,
+            append_images=rgb_images[1:],
+            duration=duration_ms,
+            loop=0,
+            disposal=2
+        )
+        return gif_path
+
+// === C://Users//BERAT//Desktop//video_to_ppt\services\grid_composer_service.py ===
+
+from typing import List
+from PIL import Image
+from domain.i_pptx_reader import IPPTXReader
+from domain.i_pptx_writer import IPPTXWriter
+from domain.i_grid_composer import IGridComposer
+from utils.grid_utils import calculate_grid_dimensions
+from config.settings import DEFAULT_GRID_MARGIN_PX
+
+class GridComposerService:
+    def __init__(self, reader: IPPTXReader, writer: IPPTXWriter, composer: IGridComposer):
+        self.reader = reader
+        self.writer = writer
+        self.composer = composer
+
+    def apply_grid(self, selected_indices: List[int], margin: int = DEFAULT_GRID_MARGIN_PX) -> None:
+        if len(selected_indices) < 2:
+            raise ValueError("En az iki slayt seçmelisiniz")
+        images = []
+        for idx in selected_indices:
+            imgs = self.reader.get_slide_images(idx)
+            images.extend(imgs)
+        if not images:
+            raise ValueError("Seçilen slaytlarda hiç resim bulunamadı")
+        rows, cols = calculate_grid_dimensions(len(images))
+        grid_image = self.composer.compose(images, rows, cols, margin)
+        self.writer.rebuild_with_grid(selected_indices, grid_image)
+        self.reader.update_from_writer(self.writer)
+
+// === C://Users//BERAT//Desktop//video_to_ppt\services\slide_upgrader.py ===
+
+from typing import List, Optional, Callable
+from PIL import Image
+from domain.i_pptx_reader import IPPTXReader
+from domain.i_pptx_writer import IPPTXWriter
+from domain.i_frame_extractor import IFrameExtractor
+import cv2
+import re
+
+class SlideUpgrader:
+    @staticmethod
+    def upgrade_slides(
+        reader: IPPTXReader,
+        writer: IPPTXWriter,
+        selected_indices: List[int],
+        extractor: IFrameExtractor,
+        target_width: int = 1920,
+        progress_callback: Optional[Callable[[int, int, int], None]] = None
+    ) -> None:
+        if not selected_indices:
+            raise ValueError("Yükseltilecek slayt seçilmedi")
+        total = len(selected_indices)
+        for i, idx in enumerate(selected_indices):
+            if progress_callback:
+                progress_callback(i, total, idx)
+            slide_text = reader.get_slide_text(idx)
+            seconds = SlideUpgrader._extract_timestamp_from_text(slide_text)
+            if seconds is None:
+                continue
+            high_res_bgr = extractor.extract_frame(seconds, target_width=target_width)
+            if high_res_bgr is None:
+                continue
+            high_res_rgb = cv2.cvtColor(high_res_bgr, cv2.COLOR_BGR2RGB)
+            high_res_pil = Image.fromarray(high_res_rgb)
+            writer.replace_slide_image(idx, high_res_pil)
+        reader.update_from_writer(writer)
+
+    @staticmethod
+    def _extract_timestamp_from_text(text: str) -> Optional[float]:
+        match = re.search(r'(\d{2}):(\d{2}):(\d{3})', text)
+        if match:
+            minutes = int(match.group(1))
+            seconds = int(match.group(2))
+            ms = int(match.group(3))
+            return minutes * 60 + seconds + ms / 1000.0
+        return None
+
+// === C://Users//BERAT//Desktop//video_to_ppt\services\__init__.py ===
+
+
 
 // === C://Users//BERAT//Desktop//video_to_ppt\strategies\__init__.py ===
 
@@ -2926,6 +3098,7 @@ Uygulama genelinde kullanılan sabitler ve yapılandırma değerleri.
 
 # Video işleme ayarları
 DEFAULT_FPS = 1                     # Saniyede 1 kare (çok hızlı)
+TARGET_FPS = DEFAULT_FPS            # Takma ad (tutarlılık)
 DEFAULT_TARGET_WIDTH = 640          # Daha küçük çözünürlük (hız ve bellek için)
 DEFAULT_IMAGE_QUALITY = 85
 MIN_SLIDE_INTERVAL_SEC = 0.5        # Minimum slayt aralığını biraz artır (gereksiz slaytları engeller)
@@ -2966,6 +3139,22 @@ YTDL_OPTS = {
     'compat_opts': ['ejs'],
     'noplaylist': True,
 }
+
+# ========== YENİ SABİTLER (Clean Code) ==========
+# İlerleme ve zaman aşımı ayarları
+PROGRESS_UPDATE_INTERVAL_FRAMES = 30   # Her 30 frame'de bir ilerleme güncelle
+FRAME_EXTRACT_TIMEOUT_SEC = 30         # FFmpeg frame çekme zaman aşımı (saniye)
+MIN_FRAME_INTERVAL = 1                 # Minimum frame aralığı (FPS hesaplama)
+
+# GIF animasyonu varsayılanları
+DEFAULT_GIF_DURATION_PER_FRAME_SEC = 0.5  # Her karenin gösterim süresi
+DEFAULT_GIF_LOOP = 0                      # 0 = sonsuz döngü
+
+# Grid birleştirme varsayılanları
+DEFAULT_GRID_MARGIN_PX = 10
+
+# Video yükseltme (upgrade) varsayılanları
+DEFAULT_UPGRADE_TARGET_WIDTH = 1280
 
 // === C://Users//BERAT//Desktop//video_to_ppt\config\__init__.py ===
 
@@ -3067,7 +3256,7 @@ from domain.i_slide_builder import ISlideBuilder
 from domain.i_progress_reporter import IProgressReporter
 from domain.i_frame_sampler import IFrameSampler
 from strategies.frame_sampling.every_frame_sampler import EveryFrameSampler
-from config.settings import MIN_SLIDE_INTERVAL_SEC
+from config.settings import MIN_SLIDE_INTERVAL_SEC, PROGRESS_UPDATE_INTERVAL_FRAMES
 
 class SlideshowGenerator:
     def __init__(
@@ -3109,7 +3298,7 @@ class SlideshowGenerator:
 
         self._notify(100, f"Tamamlandı! {scene_count} slayt, {elapsed:.1f} saniye")
         return self.slide_builder.build()
-    
+
     def _add_first_slide(self, title: str) -> None:
         self.slide_builder.create_new_slide()
         video_url = getattr(self.video_stream, 'url', 'Bilinmiyor')
@@ -3140,7 +3329,7 @@ class SlideshowGenerator:
                 prev_frame = frame
 
             frame_index += 1
-            if frame_index % 30 == 0 and duration > 0:
+            if frame_index % PROGRESS_UPDATE_INTERVAL_FRAMES == 0 and duration > 0:
                 percent = min(100.0, (frame_index / (duration * fps)) * 100.0)
                 self._notify(percent, f"İşleniyor... ({scene_count} slayt)")
 
@@ -3220,6 +3409,23 @@ class IFrameSampler(ABC):
     @abstractmethod
     def reset(self) -> None:
         """Yeni video başlangıcında sıfırlama."""
+        pass
+
+// === C://Users//BERAT//Desktop//video_to_ppt\domain\i_generator_factory.py ===
+
+from abc import ABC, abstractmethod
+from typing import Optional
+from core.slideshow_generator import SlideshowGenerator
+from domain.i_progress_reporter import IProgressReporter
+
+class IGeneratorFactory(ABC):
+    @abstractmethod
+    def create(
+        self,
+        url: str,
+        output_dir: str = ".",
+        observer: Optional[IProgressReporter] = None
+    ) -> SlideshowGenerator:
         pass
 
 // === C://Users//BERAT//Desktop//video_to_ppt\domain\i_grid_composer.py ===
@@ -3448,23 +3654,77 @@ __all__ = [
     "ISubtitleProvider",
 ]
 
+// === C://Users//BERAT//Desktop//video_to_ppt\factories\generator_factory.py ===
+
+from typing import Optional
+from core.slideshow_generator import SlideshowGenerator
+from domain.i_generator_factory import IGeneratorFactory
+from domain.i_progress_reporter import IProgressReporter
+from infrastructure.video_downloader import VideoDownloader
+from infrastructure.local_video_stream import LocalVideoStream
+from infrastructure.pptx_slide_builder import PptxSlideBuilder
+from strategies.frame_sampling.time_based_sampler import TimeBasedSampler
+from strategies.scene_detection.robust_diff_strategy import RobustDiffStrategy
+from config.settings import DEFAULT_FPS, DEFAULT_TARGET_WIDTH, MIN_SLIDE_INTERVAL_SEC, DEFAULT_HIST_THRESHOLD, DEFAULT_PIXEL_THRESHOLD
+import os
+
+class ConcreteGeneratorFactory(IGeneratorFactory):
+    def create(
+        self,
+        url: str,
+        output_dir: str = ".",
+        observer: Optional[IProgressReporter] = None
+    ) -> SlideshowGenerator:
+        downloader = VideoDownloader()
+        try:
+            video_path = downloader.download(url)
+        except Exception as e:
+            # Observer sadece IProgressReporter olduğu için on_error yok
+            # Hata yönetimi daha üst katmanda yapılacak
+            raise
+
+        title = url.split('v=')[-1][:20] if 'v=' in url else 'video'
+        video_stream = LocalVideoStream(video_path, target_fps=DEFAULT_FPS, target_width=DEFAULT_TARGET_WIDTH)
+        scene_detector = RobustDiffStrategy(
+            hist_threshold=DEFAULT_HIST_THRESHOLD,
+            pixel_threshold=DEFAULT_PIXEL_THRESHOLD,
+        )
+        output_path = os.path.join(output_dir, f"{title}.pptx")
+        slide_builder = PptxSlideBuilder(output_path, video_title=title, video_url=url)
+        frame_sampler = TimeBasedSampler(interval_sec=1.0)
+
+        generator = SlideshowGenerator(
+            video_stream,
+            scene_detector,
+            slide_builder,
+            observer=observer,
+            min_slide_interval=MIN_SLIDE_INTERVAL_SEC,
+            frame_sampler=frame_sampler,
+            frame_queue_size=30,
+            add_first_slide_with_link=True,
+            temp_video_path=video_path,
+            downloader=downloader
+        )
+        return generator
+
 // === C://Users//BERAT//Desktop//video_to_ppt\gui\conversion_controller.py ===
 
 import queue
-import threading
 from typing import List, Optional
 from core.slideshow_generator import SlideshowGenerator
 from core.progress_notifier import ProgressNotifier
 from core.background_task_executor import BackgroundTaskExecutor
 from core.message_dispatcher import MessageDispatcher
-from config.di_container import create_generator_for_url
+from domain.i_generator_factory import IGeneratorFactory
+from factories.generator_factory import ConcreteGeneratorFactory
 
 class ConversionController:
-    def __init__(self, msg_queue: queue.Queue):
+    def __init__(self, msg_queue: queue.Queue, factory: Optional[IGeneratorFactory] = None):
         self.msg_queue = msg_queue
         self.dispatcher = MessageDispatcher(msg_queue)
         self.notifier = ProgressNotifier(msg_queue)
         self.executor = BackgroundTaskExecutor()
+        self.factory = factory if factory else ConcreteGeneratorFactory()
 
     @property
     def is_running(self) -> bool:
@@ -3496,7 +3756,7 @@ class ConversionController:
             self.dispatcher.progress(percent, f"({idx+1}/{total}) İşleniyor: {url}")
 
             try:
-                generator = create_generator_for_url(url, observer=self.notifier)
+                generator = self.factory.create(url, observer=self.notifier)
                 pptx_path = generator.generate_slideshow()
                 self.dispatcher.result(url, pptx_path)
                 self.dispatcher.open_editor(pptx_path, generator.temp_video_path)
@@ -3644,20 +3904,18 @@ from domain.i_pptx_reader import IPPTXReader
 from domain.i_pptx_writer import IPPTXWriter
 from domain.i_grid_composer import IGridComposer
 from utils.grid_utils import calculate_grid_dimensions
-from infrastructure.high_res_frame_extractor import HighResFrameExtractor
-from utils.url_resolver import resolve_video_url
-import re
-import cv2
-import numpy as np
-import tempfile
-import os
+from services.slide_upgrader import SlideUpgrader
+from services.gif_animator import GifAnimator
+from services.grid_composer_service import GridComposerService
 from domain.i_frame_extractor import IFrameExtractor
+import re
 
 class PPTGridController:
     def __init__(self, reader: IPPTXReader, writer: IPPTXWriter, composer: IGridComposer):
         self.reader = reader
         self.writer = writer
         self.composer = composer
+        self.grid_service = GridComposerService(reader, writer, composer)
 
     def get_slide_count(self) -> int:
         return self.reader.get_slide_count()
@@ -3672,18 +3930,7 @@ class PPTGridController:
         self.reader.update_from_writer(self.writer)
 
     def apply_grid(self, selected_indices: List[int], margin: int = 10) -> None:
-        if len(selected_indices) < 2:
-            raise ValueError("En az iki slayt seçmelisiniz")
-        images = []
-        for idx in selected_indices:
-            imgs = self.reader.get_slide_images(idx)
-            images.extend(imgs)
-        if not images:
-            raise ValueError("Seçilen slaytlarda hiç resim bulunamadı")
-        rows, cols = calculate_grid_dimensions(len(images))
-        grid_image = self.composer.compose(images, rows, cols, margin)
-        self.writer.rebuild_with_grid(selected_indices, grid_image)
-        self.reader.update_from_writer(self.writer)
+        self.grid_service.apply_grid(selected_indices, margin)
 
     def save(self, path: str) -> None:
         self.writer.save(path)
@@ -3693,93 +3940,18 @@ class PPTGridController:
         self.writer.close()
 
     def upgrade_slides(self, selected_indices: List[int], extractor: IFrameExtractor, target_width: int = 1920, progress_callback: Optional[Callable[[int, int, int], None]] = None) -> None:
-        if not selected_indices:
-            raise ValueError("Yükseltilecek slayt seçilmedi")
-        # video_url'yi ilk slayttan al, extractor zaten bu URL ile oluşturulmuş olmalı
-        total = len(selected_indices)
-        for i, idx in enumerate(selected_indices):
-            if progress_callback:
-                progress_callback(i, total, idx)
-            slide_text = self.reader.get_slide_text(idx)
-            seconds = self._extract_timestamp_from_text(slide_text)
-            if seconds is None:
-                continue
-            high_res_bgr = extractor.extract_frame(seconds, target_width=target_width)
-            if high_res_bgr is None:
-                continue
-            high_res_rgb = cv2.cvtColor(high_res_bgr, cv2.COLOR_BGR2RGB)
-            high_res_pil = Image.fromarray(high_res_rgb)
-            self.writer.replace_slide_image(idx, high_res_pil)
-        self.reader.update_from_writer(self.writer)
+        SlideUpgrader.upgrade_slides(self.reader, self.writer, selected_indices, extractor, target_width, progress_callback)
 
-    # ----- Yeni GIF Stratejisi -----
     def replace_slides_with_gif(self, selected_indices: List[int], duration_per_frame: float = 0.5) -> None:
-        """
-        Seçili slaytlardaki ilk resimleri kullanarak bir GIF animasyonu oluşturur,
-        diğer slaytları siler ve GIF'i kalan slayta resim olarak ekler.
-        """
-        if len(selected_indices) < 2:
-            raise ValueError("En az iki slayt seçmelisiniz")
+        GifAnimator.replace_slides_with_gif(self.reader, self.writer, selected_indices, duration_per_frame)
 
-        # 1. Seçili slaytlardaki ilk resimleri topla (PIL Image)
-        images = []
-        for idx in selected_indices:
-            imgs = self.reader.get_slide_images(idx)
-            if imgs:
-                # İlk resmi al, RGB moduna çevir
-                img = imgs[0].convert('RGB')
-                images.append(img)
-        if not images:
-            raise ValueError("Seçilen slaytlarda hiç resim bulunamadı")
-
-        # 2. Geçici GIF dosyası oluştur
-        fd, gif_path = tempfile.mkstemp(suffix='.gif')
-        os.close(fd)
-        try:
-            duration_ms = int(duration_per_frame * 1000)
-            images[0].save(
-                gif_path,
-                save_all=True,
-                append_images=images[1:],
-                duration=duration_ms,
-                loop=0,           # sonsuz döngü
-                disposal=2
-            )
-
-            # 3. Diğer slaytları sil (sadece en küçük indeksli slayt kalacak)
-            min_idx = min(selected_indices)
-            other_indices = [idx for idx in selected_indices if idx != min_idx]
-            if other_indices:
-                self.writer.delete_slides(other_indices)
-
-            # 4. Kalan slaytın içeriğini tamamen temizle ve GIF'i ekle
-            self.writer.replace_slide_with_image(min_idx, gif_path)
-
-            # 5. Değişiklikleri kaydet
-            self.writer.save(self.writer.source_path)
-            self.reader.update_from_writer(self.writer)
-
-        finally:
-            if os.path.exists(gif_path):
-                os.unlink(gif_path)
-
-    # ----- Yardımcı Metodlar -----
-    def _extract_url_from_text(self, text: str) -> Optional[str]:
-        match = re.search(r'Video URL:\s*(https?://[^\s]+)', text)
-        return match.group(1) if match else None
-
-    def _extract_timestamp_from_text(self, text: str) -> Optional[float]:
-        match = re.search(r'(\d{2}):(\d{2}):(\d{3})', text)
-        if match:
-            minutes = int(match.group(1))
-            seconds = int(match.group(2))
-            ms = int(match.group(3))
-            return minutes * 60 + seconds + ms / 1000.0
-        return None
-    
     def get_video_url_from_first_slide(self) -> Optional[str]:
         first_slide_text = self.reader.get_slide_text(0)
         return self._extract_url_from_text(first_slide_text)
+
+    def _extract_url_from_text(self, text: str) -> Optional[str]:
+        match = re.search(r'Video URL:\s*(https?://[^\s]+)', text)
+        return match.group(1) if match else None
 
 // === C://Users//BERAT//Desktop//video_to_ppt\gui\ppt_grid_editor_frame.py ===
 
@@ -3795,7 +3967,7 @@ from infrastructure.grid_composer import PillowGridComposer
 from gui.ppt_grid_controller import PPTGridController
 from utils.url_resolver import resolve_video_url
 from infrastructure.high_res_frame_extractor import HighResFrameExtractor
-import threading
+from config.settings import DEFAULT_GRID_MARGIN_PX, DEFAULT_UPGRADE_TARGET_WIDTH
 
 class PPTGridEditorFrame(ttk.Frame):
     def __init__(self, parent, temp_video_path=None):
@@ -4047,7 +4219,7 @@ class PPTGridEditorFrame(ttk.Frame):
         try:
             self.status_label.config(text="Birleştiriliyor...")
             self.update_idletasks()
-            self.controller.apply_grid(self.selected_indices, margin=10)
+            self.controller.apply_grid(self.selected_indices, margin=DEFAULT_GRID_MARGIN_PX)
             self.controller.save(self.current_pptx_path)
             self.status_label.config(text="Birleştirme tamamlandı, slaytlar güncellendi.")
             self.refresh_slides()
@@ -4068,7 +4240,6 @@ class PPTGridEditorFrame(ttk.Frame):
         self.status_label.config(text=f"Yüksek kaliteli kareler alınıyor (0/{total})...")
         self.update_idletasks()
 
-        # İlk slayttan video URL'sini al
         youtube_url = self.controller.get_video_url_from_first_slide()
         if not youtube_url:
             messagebox.showerror("Hata", "İlk slaytta video URL'si bulunamadı")
@@ -4087,7 +4258,7 @@ class PPTGridEditorFrame(ttk.Frame):
                     self.after(0, lambda: self.status_label.config(
                         text=f"Yüksek kaliteli kareler alınıyor ({current+1}/{total}) - Slayt {slide_idx+1}..."
                     ))
-                self.controller.upgrade_slides(self.selected_indices, extractor, target_width=1280, progress_callback=progress_callback)
+                self.controller.upgrade_slides(self.selected_indices, extractor, target_width=DEFAULT_UPGRADE_TARGET_WIDTH, progress_callback=progress_callback)
                 self.controller.save(self.current_pptx_path)
                 self.after(0, self._upgrade_finished_success)
             except Exception as e:
@@ -4515,6 +4686,7 @@ import numpy as np
 from PIL import Image
 from typing import Optional
 from utils.ffmpeg_utils import get_ffmpeg_path
+from config.settings import FRAME_EXTRACT_TIMEOUT_SEC
 
 class HighResFrameExtractor:
     def __init__(self, video_url: str):
@@ -4522,7 +4694,7 @@ class HighResFrameExtractor:
         self.ffmpeg_path = get_ffmpeg_path()
         print(f"[HighResFrameExtractor] URL: {video_url[:100]}...")
 
-    def extract_frame(self, seconds: float, target_width: int = 1920, timeout: int = 30) -> Optional[np.ndarray]:
+    def extract_frame(self, seconds: float, target_width: int = 1920, timeout: int = FRAME_EXTRACT_TIMEOUT_SEC) -> Optional[np.ndarray]:
         print(f"[HighResFrameExtractor] Kare alınıyor: zaman={seconds:.3f} sn, genişlik={target_width}")
         cmd = [
             self.ffmpeg_path,
@@ -4578,6 +4750,7 @@ import cv2
 import numpy as np
 from typing import Optional, Dict
 from domain.i_video_stream import IVideoStream
+from config.settings import MIN_FRAME_INTERVAL
 
 class LocalVideoStream(IVideoStream):
     def __init__(self, file_path: str, target_fps: int = 1, target_width: int = 640):
@@ -4590,7 +4763,7 @@ class LocalVideoStream(IVideoStream):
         self._orig_fps = self.cap.get(cv2.CAP_PROP_FPS)
         if self._orig_fps <= 0:
             raise IOError("Video FPS bilgisi alınamadı")
-        self._frame_interval = max(1, int(round(self._orig_fps / target_fps)))
+        self._frame_interval = max(MIN_FRAME_INTERVAL, int(round(self._orig_fps / target_fps)))
         self._frame_index = 0
         self._total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
@@ -5387,6 +5560,177 @@ __all__ = [
     "RawVideoDumper",
     "FallbackFrameReader",
 ]
+
+// === C://Users//BERAT//Desktop//video_to_ppt\services\gif_animator.py ===
+
+import tempfile
+import os
+from typing import List
+from PIL import Image
+from domain.i_pptx_reader import IPPTXReader
+from domain.i_pptx_writer import IPPTXWriter
+from config.settings import DEFAULT_GIF_DURATION_PER_FRAME_SEC, DEFAULT_GIF_LOOP
+
+class GifAnimator:
+    @staticmethod
+    def replace_slides_with_gif(
+        reader: IPPTXReader,
+        writer: IPPTXWriter,
+        selected_indices: List[int],
+        duration_per_frame: float = DEFAULT_GIF_DURATION_PER_FRAME_SEC
+    ) -> None:
+        if len(selected_indices) < 2:
+            raise ValueError("En az iki slayt seçmelisiniz")
+
+        images = []
+        for idx in selected_indices:
+            imgs = reader.get_slide_images(idx)
+            if imgs:
+                img = imgs[0].convert('RGB')
+                images.append(img)
+        if not images:
+            raise ValueError("Seçilen slaytlarda hiç resim bulunamadı")
+
+        fd, gif_path = tempfile.mkstemp(suffix='.gif')
+        os.close(fd)
+        try:
+            duration_ms = int(duration_per_frame * 1000)
+            images[0].save(
+                gif_path,
+                save_all=True,
+                append_images=images[1:],
+                duration=duration_ms,
+                loop=DEFAULT_GIF_LOOP,
+                disposal=2  # disposal=2: arka planı temizle (her frame'de önceki silinir)
+            )
+
+            min_idx = min(selected_indices)
+            other_indices = [idx for idx in selected_indices if idx != min_idx]
+            if other_indices:
+                writer.delete_slides(other_indices)
+
+            writer.replace_slide_with_image(min_idx, gif_path)
+            writer.save(writer.source_path)
+            reader.update_from_writer(writer)
+        finally:
+            if os.path.exists(gif_path):
+                os.unlink(gif_path)
+
+// === C://Users//BERAT//Desktop//video_to_ppt\services\gif_creator.py ===
+
+from typing import List
+from PIL import Image
+import tempfile
+import os
+
+class GifCreator:
+    @staticmethod
+    def create_gif_from_images(images: List[Image.Image], duration_per_frame: float = 0.5) -> str:
+        """
+        Verilen PIL Image listesinden bir GIF dosyası oluşturur ve yolunu döndürür.
+        """
+        if len(images) < 2:
+            raise ValueError("En az iki görüntü gerekir")
+        
+        # Tüm görüntüleri RGB moduna çevir
+        rgb_images = [img.convert('RGB') for img in images]
+        
+        # Geçici GIF dosyası oluştur
+        fd, gif_path = tempfile.mkstemp(suffix='.gif')
+        os.close(fd)
+        
+        duration_ms = int(duration_per_frame * 1000)
+        rgb_images[0].save(
+            gif_path,
+            save_all=True,
+            append_images=rgb_images[1:],
+            duration=duration_ms,
+            loop=0,
+            disposal=2
+        )
+        return gif_path
+
+// === C://Users//BERAT//Desktop//video_to_ppt\services\grid_composer_service.py ===
+
+from typing import List
+from PIL import Image
+from domain.i_pptx_reader import IPPTXReader
+from domain.i_pptx_writer import IPPTXWriter
+from domain.i_grid_composer import IGridComposer
+from utils.grid_utils import calculate_grid_dimensions
+from config.settings import DEFAULT_GRID_MARGIN_PX
+
+class GridComposerService:
+    def __init__(self, reader: IPPTXReader, writer: IPPTXWriter, composer: IGridComposer):
+        self.reader = reader
+        self.writer = writer
+        self.composer = composer
+
+    def apply_grid(self, selected_indices: List[int], margin: int = DEFAULT_GRID_MARGIN_PX) -> None:
+        if len(selected_indices) < 2:
+            raise ValueError("En az iki slayt seçmelisiniz")
+        images = []
+        for idx in selected_indices:
+            imgs = self.reader.get_slide_images(idx)
+            images.extend(imgs)
+        if not images:
+            raise ValueError("Seçilen slaytlarda hiç resim bulunamadı")
+        rows, cols = calculate_grid_dimensions(len(images))
+        grid_image = self.composer.compose(images, rows, cols, margin)
+        self.writer.rebuild_with_grid(selected_indices, grid_image)
+        self.reader.update_from_writer(self.writer)
+
+// === C://Users//BERAT//Desktop//video_to_ppt\services\slide_upgrader.py ===
+
+from typing import List, Optional, Callable
+from PIL import Image
+from domain.i_pptx_reader import IPPTXReader
+from domain.i_pptx_writer import IPPTXWriter
+from domain.i_frame_extractor import IFrameExtractor
+import cv2
+import re
+
+class SlideUpgrader:
+    @staticmethod
+    def upgrade_slides(
+        reader: IPPTXReader,
+        writer: IPPTXWriter,
+        selected_indices: List[int],
+        extractor: IFrameExtractor,
+        target_width: int = 1920,
+        progress_callback: Optional[Callable[[int, int, int], None]] = None
+    ) -> None:
+        if not selected_indices:
+            raise ValueError("Yükseltilecek slayt seçilmedi")
+        total = len(selected_indices)
+        for i, idx in enumerate(selected_indices):
+            if progress_callback:
+                progress_callback(i, total, idx)
+            slide_text = reader.get_slide_text(idx)
+            seconds = SlideUpgrader._extract_timestamp_from_text(slide_text)
+            if seconds is None:
+                continue
+            high_res_bgr = extractor.extract_frame(seconds, target_width=target_width)
+            if high_res_bgr is None:
+                continue
+            high_res_rgb = cv2.cvtColor(high_res_bgr, cv2.COLOR_BGR2RGB)
+            high_res_pil = Image.fromarray(high_res_rgb)
+            writer.replace_slide_image(idx, high_res_pil)
+        reader.update_from_writer(writer)
+
+    @staticmethod
+    def _extract_timestamp_from_text(text: str) -> Optional[float]:
+        match = re.search(r'(\d{2}):(\d{2}):(\d{3})', text)
+        if match:
+            minutes = int(match.group(1))
+            seconds = int(match.group(2))
+            ms = int(match.group(3))
+            return minutes * 60 + seconds + ms / 1000.0
+        return None
+
+// === C://Users//BERAT//Desktop//video_to_ppt\services\__init__.py ===
+
+
 
 // === C://Users//BERAT//Desktop//video_to_ppt\strategies\__init__.py ===
 

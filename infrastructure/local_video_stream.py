@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 from typing import Optional, Dict
 from domain.i_video_stream import IVideoStream
+from config.settings import MIN_FRAME_INTERVAL
 
 class LocalVideoStream(IVideoStream):
     def __init__(self, file_path: str, target_fps: int = 1, target_width: int = 640):
@@ -14,7 +15,7 @@ class LocalVideoStream(IVideoStream):
         self._orig_fps = self.cap.get(cv2.CAP_PROP_FPS)
         if self._orig_fps <= 0:
             raise IOError("Video FPS bilgisi alınamadı")
-        self._frame_interval = max(1, int(round(self._orig_fps / target_fps)))
+        self._frame_interval = max(MIN_FRAME_INTERVAL, int(round(self._orig_fps / target_fps)))
         self._frame_index = 0
         self._total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
 

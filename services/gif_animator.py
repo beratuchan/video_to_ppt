@@ -1,9 +1,10 @@
+import tempfile
+import os
 from typing import List
 from PIL import Image
 from domain.i_pptx_reader import IPPTXReader
 from domain.i_pptx_writer import IPPTXWriter
-import tempfile
-import os
+from config.settings import DEFAULT_GIF_DURATION_PER_FRAME_SEC, DEFAULT_GIF_LOOP
 
 class GifAnimator:
     @staticmethod
@@ -11,7 +12,7 @@ class GifAnimator:
         reader: IPPTXReader,
         writer: IPPTXWriter,
         selected_indices: List[int],
-        duration_per_frame: float = 0.5
+        duration_per_frame: float = DEFAULT_GIF_DURATION_PER_FRAME_SEC
     ) -> None:
         if len(selected_indices) < 2:
             raise ValueError("En az iki slayt seçmelisiniz")
@@ -34,8 +35,8 @@ class GifAnimator:
                 save_all=True,
                 append_images=images[1:],
                 duration=duration_ms,
-                loop=0,
-                disposal=2
+                loop=DEFAULT_GIF_LOOP,
+                disposal=2  # disposal=2: arka planı temizle (her frame'de önceki silinir)
             )
 
             min_idx = min(selected_indices)
@@ -46,7 +47,6 @@ class GifAnimator:
             writer.replace_slide_with_image(min_idx, gif_path)
             writer.save(writer.source_path)
             reader.update_from_writer(writer)
-
         finally:
             if os.path.exists(gif_path):
                 os.unlink(gif_path)
