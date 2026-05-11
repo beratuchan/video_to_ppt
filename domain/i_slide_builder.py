@@ -8,7 +8,7 @@ class ISlideBuilder(ABC):
         pass
 
     @abstractmethod
-    def add_image(self, image: np.ndarray, max_width: int = 1024, quality: int = 85) -> None:
+    def add_image(self, image: np.ndarray, max_width: int = 1024, quality: int = 85, vertical_align: str = "top") -> None:
         pass
 
     @abstractmethod

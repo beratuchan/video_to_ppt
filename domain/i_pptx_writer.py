@@ -17,6 +17,11 @@ class IPPTXWriter(ABC):
         pass
 
     @abstractmethod
+    def replace_slide_with_image(self, slide_index: int, image_path: str, left_inch: float = 1.0, top_inch: float = 1.0, width_inch: float = 8.0, height_inch: float = 6.0) -> None:
+        """Belirtilen slayttaki tüm içeriği temizleyip verilen resim dosyasını ekler."""
+        pass
+
+    @abstractmethod
     def save(self, path: str) -> None:
         pass
 

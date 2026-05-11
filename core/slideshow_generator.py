@@ -3,7 +3,7 @@ from typing import Optional
 from domain.i_video_stream import IVideoStream
 from domain.i_scene_detector import ISceneDetector
 from domain.i_slide_builder import ISlideBuilder
-from domain.i_progress_observer import IProgressObserver
+from domain.i_progress_reporter import IProgressReporter
 from domain.i_frame_sampler import IFrameSampler
 from strategies.frame_sampling.every_frame_sampler import EveryFrameSampler
 from config.settings import MIN_SLIDE_INTERVAL_SEC
@@ -14,7 +14,7 @@ class SlideshowGenerator:
         video_stream: IVideoStream,
         scene_detector: ISceneDetector,
         slide_builder: ISlideBuilder,
-        observer: Optional[IProgressObserver] = None,
+        observer: Optional[IProgressReporter] = None,
         min_slide_interval: float = MIN_SLIDE_INTERVAL_SEC,
         frame_sampler: Optional[IFrameSampler] = None,
         frame_queue_size: int = 30,

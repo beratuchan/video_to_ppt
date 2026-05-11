@@ -2,7 +2,7 @@ from infrastructure.video_downloader import VideoDownloader
 from infrastructure.local_video_stream import LocalVideoStream
 from infrastructure.pptx_slide_builder import PptxSlideBuilder
 from core.slideshow_generator import SlideshowGenerator
-from domain.i_progress_observer import IProgressObserver
+from domain.i_progress_reporter import IProgressReporter
 from strategies.frame_sampling.time_based_sampler import TimeBasedSampler
 from strategies.scene_detection.robust_diff_strategy import RobustDiffStrategy
 from config.settings import *
@@ -12,14 +12,15 @@ from typing import Optional
 def create_generator_for_url(
     url: str,
     output_dir: str = ".",
-    observer: Optional[IProgressObserver] = None
+    observer: Optional[IProgressReporter] = None
 ) -> SlideshowGenerator:
     downloader = VideoDownloader()
     try:
         video_path = downloader.download(url)
     except Exception as e:
-        if observer:
-            observer.on_error(url, str(e))
+        # Not: observer IProgressReporter olduğu için on_error metodu yok.
+        # Hata bildirimi yapmak için farklı bir mekanizma gerekir.
+        # Bu, ilerleyen aşamalarda düzeltilecektir.
         raise
 
     title = url.split('v=')[-1][:20] if 'v=' in url else 'video'

@@ -18,6 +18,21 @@ class LocalVideoStream(IVideoStream):
         self._frame_index = 0
         self._total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
+        # İlk frame'i okuyarak gerçek yüksekliği hesapla (target_width'e göre ölçeklenmiş)
+        ret, first_frame = self.cap.read()
+        if ret:
+            orig_height = first_frame.shape[0]
+            orig_width = first_frame.shape[1]
+            if self.target_width and orig_width > self.target_width:
+                ratio = self.target_width / orig_width
+                self._actual_height = int(orig_height * ratio)
+            else:
+                self._actual_height = orig_height
+        else:
+            self._actual_height = 0
+        # Okuma pozisyonunu başa al
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
     def get_frame(self) -> Optional[np.ndarray]:
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, self._frame_index)
         ret, frame = self.cap.read()
@@ -36,7 +51,7 @@ class LocalVideoStream(IVideoStream):
             'title': 'Video',
             'duration_seconds': duration,
             'width': self.target_width,
-            'height': 0,
+            'height': self._actual_height,
             'fps': self.target_fps,
         }
 

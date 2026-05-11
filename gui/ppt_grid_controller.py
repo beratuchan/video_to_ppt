@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 import tempfile
 import os
+from domain.i_frame_extractor import IFrameExtractor
 
 class PPTGridController:
     def __init__(self, reader: IPPTXReader, writer: IPPTXWriter, composer: IGridComposer):
@@ -51,17 +52,10 @@ class PPTGridController:
         self.reader.close()
         self.writer.close()
 
-    def upgrade_slides(self, selected_indices: List[int], target_width: int = 1920, progress_callback: Optional[Callable[[int, int, int], None]] = None) -> None:
+    def upgrade_slides(self, selected_indices: List[int], extractor: IFrameExtractor, target_width: int = 1920, progress_callback: Optional[Callable[[int, int, int], None]] = None) -> None:
         if not selected_indices:
             raise ValueError("Yükseltilecek slayt seçilmedi")
-        first_slide_text = self.reader.get_slide_text(0)
-        youtube_url = self._extract_url_from_text(first_slide_text)
-        if not youtube_url:
-            raise ValueError("İlk slaytta video URL'si bulunamadı")
-        video_stream_url = resolve_video_url(youtube_url)
-        if not video_stream_url:
-            raise ValueError("Video akış URL'si alınamadı")
-        extractor = HighResFrameExtractor(video_stream_url)
+        # video_url'yi ilk slayttan al, extractor zaten bu URL ile oluşturulmuş olmalı
         total = len(selected_indices)
         for i, idx in enumerate(selected_indices):
             if progress_callback:
@@ -142,3 +136,7 @@ class PPTGridController:
             ms = int(match.group(3))
             return minutes * 60 + seconds + ms / 1000.0
         return None
+    
+    def get_video_url_from_first_slide(self) -> Optional[str]:
+        first_slide_text = self.reader.get_slide_text(0)
+        return self._extract_url_from_text(first_slide_text)

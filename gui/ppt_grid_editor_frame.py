@@ -8,6 +8,9 @@ from infrastructure.python_pptx_reader import PythonPPTXReader
 from infrastructure.python_pptx_writer import PythonPPTXWriter
 from infrastructure.grid_composer import PillowGridComposer
 from gui.ppt_grid_controller import PPTGridController
+from utils.url_resolver import resolve_video_url
+from infrastructure.high_res_frame_extractor import HighResFrameExtractor
+import threading
 
 class PPTGridEditorFrame(ttk.Frame):
     def __init__(self, parent, temp_video_path=None):
@@ -280,13 +283,26 @@ class PPTGridEditorFrame(ttk.Frame):
         self.status_label.config(text=f"Yüksek kaliteli kareler alınıyor (0/{total})...")
         self.update_idletasks()
 
+        # İlk slayttan video URL'sini al
+        youtube_url = self.controller.get_video_url_from_first_slide()
+        if not youtube_url:
+            messagebox.showerror("Hata", "İlk slaytta video URL'si bulunamadı")
+            self._enable_buttons()
+            return
+        video_stream_url = resolve_video_url(youtube_url)
+        if not video_stream_url:
+            messagebox.showerror("Hata", "Video akış URL'si alınamadı")
+            self._enable_buttons()
+            return
+        extractor = HighResFrameExtractor(video_stream_url)
+
         def task():
             try:
                 def progress_callback(current, total, slide_idx):
                     self.after(0, lambda: self.status_label.config(
                         text=f"Yüksek kaliteli kareler alınıyor ({current+1}/{total}) - Slayt {slide_idx+1}..."
                     ))
-                self.controller.upgrade_slides(self.selected_indices, target_width=1280, progress_callback=progress_callback)
+                self.controller.upgrade_slides(self.selected_indices, extractor, target_width=1280, progress_callback=progress_callback)
                 self.controller.save(self.current_pptx_path)
                 self.after(0, self._upgrade_finished_success)
             except Exception as e:

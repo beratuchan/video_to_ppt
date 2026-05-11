@@ -2,30 +2,31 @@ import yt_dlp
 import tempfile
 import os
 import time
-import shutil
+from typing import List, Optional
+from domain.i_download_strategy import IDownloadStrategy
+from strategies.download import BestMp4Strategy, BestVideoPlusAudioStrategy, BestAnyStrategy
 from utils.ffmpeg_utils import get_ffmpeg_path
 
 class VideoDownloader:
-    def __init__(self):
+    def __init__(self, strategies: Optional[List[IDownloadStrategy]] = None):
         self.temp_file = None
         self.ffmpeg_path = get_ffmpeg_path()
+        if strategies is None:
+            strategies = [
+                BestMp4Strategy(),
+                BestVideoPlusAudioStrategy(),
+                BestAnyStrategy(),
+            ]
+        self.strategies = strategies
 
     def download(self, url: str) -> str:
-        # En kararlı format sırası
-        format_options = [
-            'best[ext=mp4]',           # En iyi mp4
-            'bestvideo[ext=mp4]+bestaudio',  # Ayrı video+ses, birleştir
-            'best',                    # En iyi herhangi bir format
-        ]
-
         last_exception = None
-        for fmt in format_options:
-            # Her format için yeni bir geçici dosya oluştur
+        for strategy in self.strategies:
             fd, path = tempfile.mkstemp(suffix='.mp4')
             os.close(fd)
 
             ydl_opts = {
-                'format': fmt,
+                'format': strategy.get_format_spec(),
                 'outtmpl': path,
                 'ffmpeg_location': self.ffmpeg_path,
                 'quiet': False,
@@ -34,13 +35,13 @@ class VideoDownloader:
                 'retries': 10,
                 'fragment_retries': 10,
                 'merge_output_format': 'mp4',
-                'overwrites': True,      # Var olanı sil
-                'continuedl': False,     # Kaldığı yerden devam etme
+                'overwrites': True,
+                'continuedl': False,
                 'nooverwrites': False,
             }
 
             try:
-                print(f"[Download] Denenen format: {fmt}")
+                print(f"[Download] Denenen strateji: {strategy.get_name()} ({strategy.get_format_spec()})")
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([url])
 
@@ -48,15 +49,12 @@ class VideoDownloader:
                 if os.path.exists(path) and os.path.getsize(path) > 0:
                     print(f"[Download] Başarılı: {path} ({os.path.getsize(path)} bytes)")
                     self.temp_file = path
-                    # Diğer format denemelerinden kalan dosyaları temizle (varsa)
-                    # Burada sadece başarılı dosyayı döneceğiz
                     return path
                 else:
                     raise RuntimeError("Dosya boş oluştu")
             except Exception as e:
                 last_exception = e
-                print(f"[Download] {fmt} formatı başarısız: {e}")
-                # Başarısız dosyayı sil
+                print(f"[Download] {strategy.get_name()} başarısız: {e}")
                 if os.path.exists(path):
                     os.unlink(path)
                 continue
