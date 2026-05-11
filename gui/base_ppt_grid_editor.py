@@ -13,28 +13,21 @@ from infrastructure.high_res_frame_extractor import HighResFrameExtractor
 from config.settings import DEFAULT_GRID_MARGIN_PX, DEFAULT_UPGRADE_TARGET_WIDTH
 
 class BasePPTGridEditor(tk.Frame):
-    """
-    Tüm PPT düzenleyici frame'ler için temel sınıf.
-    Alt sınıflar sadece stil ve cleanup gibi özelleştirmeleri sağlar.
-    """
-
     def __init__(self, parent, temp_video_path=None, **kwargs):
         super().__init__(parent, **kwargs)
         self.controller = None
-        self.thumbnails = []
-        self.selected_indices = []
+        self.thumbnails = []  # list of (photo, var, index)
+        self.selected_indices = []  # list of slide indices (sorted)
+        self.carousel_index = 0  # index within selected_indices
         self.settings_file = os.path.join(os.path.dirname(__file__), "..", "config", "ppt_grid_settings.json")
         self.current_pptx_path = None
         self.pptx_files = []
         self.temp_video_path = temp_video_path
         self.last_clicked_index = None
-        self._current_preview_image = None
-        self._current_preview_index = None
         self._create_widgets()
         self.load_last_working_directory()
         self._bind_mousewheel()
 
-    # ---- Stil özelleştirmeleri (alt sınıflar override edebilir) ----
     def get_button_bg_color(self, button_name: str) -> str:
         return ""
 
@@ -50,7 +43,6 @@ class BasePPTGridEditor(tk.Frame):
     def on_close_cleanup(self):
         pass
 
-    # ---- Ortak metodlar ----
     def _bind_mousewheel(self):
         self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
         self.canvas.bind_all("<Button-4>", self._on_mousewheel)
@@ -65,7 +57,6 @@ class BasePPTGridEditor(tk.Frame):
             self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
 
     def _create_widgets(self):
-        # Üst kontrol çubuğu
         top_frame = ttk.Frame(self)
         top_frame.pack(pady=5, fill=tk.X, padx=10)
 
@@ -81,57 +72,26 @@ class BasePPTGridEditor(tk.Frame):
         self.file_combo.pack(side=tk.LEFT, padx=5)
         self.file_combo.bind("<<ComboboxSelected>>", self.on_file_selected)
 
-        # Buton çubuğu
         btn_frame = tk.Frame(self)
         btn_frame.pack(pady=10)
 
-        btn_kwargs = {}
-        bg = self.get_button_bg_color("delete")
-        if bg:
-            btn_kwargs["bg"] = bg
-        fg = self.get_button_fg_color("delete")
-        if fg:
-            btn_kwargs["fg"] = fg
-        self.btn_delete = tk.Button(btn_frame, text="Seçili Slaytları Sil", command=self.delete_selected, **btn_kwargs)
+        self.btn_delete = tk.Button(btn_frame, text="Seçili Slaytları Sil", command=self.delete_selected)
         self.btn_delete.pack(side=tk.LEFT, padx=10)
 
-        btn_kwargs = {}
-        bg = self.get_button_bg_color("grid")
-        if bg:
-            btn_kwargs["bg"] = bg
-        fg = self.get_button_fg_color("grid")
-        if fg:
-            btn_kwargs["fg"] = fg
-        self.btn_grid = tk.Button(btn_frame, text="Seçili Slaytları Grid Slaytta Birleştir", command=self.grid_selected, **btn_kwargs)
+        self.btn_grid = tk.Button(btn_frame, text="Seçili Slaytları Grid Slaytta Birleştir", command=self.grid_selected)
         self.btn_grid.pack(side=tk.LEFT, padx=10)
 
-        btn_kwargs = {}
-        bg = self.get_button_bg_color("upgrade")
-        if bg:
-            btn_kwargs["bg"] = bg
-        fg = self.get_button_fg_color("upgrade")
-        if fg:
-            btn_kwargs["fg"] = fg
-        self.btn_upgrade = tk.Button(btn_frame, text="Seçili Slaytları Yüksek Kaliteye Yükselt", command=self.upgrade_selected, **btn_kwargs)
+        self.btn_upgrade = tk.Button(btn_frame, text="Seçili Slaytları Yüksek Kaliteye Yükselt", command=self.upgrade_selected)
         self.btn_upgrade.pack(side=tk.LEFT, padx=10)
 
-        btn_kwargs = {}
-        bg = self.get_button_bg_color("gif")
-        if bg:
-            btn_kwargs["bg"] = bg
-        fg = self.get_button_fg_color("gif")
-        if fg:
-            btn_kwargs["fg"] = fg
-        self.btn_gif = tk.Button(btn_frame, text="Seçili Slaytları GIF Animasyonu Yap", command=self.gif_selected, **btn_kwargs)
+        self.btn_gif = tk.Button(btn_frame, text="Seçili Slaytları GIF Animasyonu Yap", command=self.gif_selected)
         self.btn_gif.pack(side=tk.LEFT, padx=10)
 
         self._disable_buttons()
 
-        # Ana içeriği iki bölüme ayır (sol: thumbnail listesi, sağ: büyük önizleme)
         paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-        # Sol taraf (thumbnails) - daha dar
         left_frame = ttk.Frame(paned)
         paned.add(left_frame, weight=1)
 
@@ -147,7 +107,6 @@ class BasePPTGridEditor(tk.Frame):
         self.canvas.create_window((0,0), window=self.inner, anchor="nw")
         self.inner.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
 
-        # Sağ taraf (büyük önizleme) - daha geniş
         right_frame = ttk.Frame(paned)
         paned.add(right_frame, weight=2)
 
@@ -158,14 +117,20 @@ class BasePPTGridEditor(tk.Frame):
         self.preview_info_label = ttk.Label(right_frame, text="Slayt seçilmedi", anchor="center")
         self.preview_info_label.pack(pady=5)
 
-        # Durum çubuğu
+        carousel_frame = tk.Frame(right_frame)
+        carousel_frame.pack(pady=10)
+        self.btn_prev = tk.Button(carousel_frame, text="◄ Önceki", command=self._carousel_prev, state=tk.DISABLED)
+        self.btn_prev.pack(side=tk.LEFT, padx=5)
+        self.btn_next = tk.Button(carousel_frame, text="Sonraki ►", command=self._carousel_next, state=tk.DISABLED)
+        self.btn_next.pack(side=tk.LEFT, padx=5)
+        self.carousel_counter = ttk.Label(right_frame, text="", anchor="center")
+        self.carousel_counter.pack(pady=2)
+
         self.status_label = ttk.Label(self, text="", anchor="w")
         self.status_label.pack(fill=tk.X, padx=10, pady=5)
 
     def _on_preview_resize(self, event):
-        """Preview label boyutu değiştiğinde mevcut görseli yeniden boyutlandır."""
-        if self._current_preview_image and self._current_preview_index is not None:
-            self._update_large_preview(self._current_preview_index)
+        self._update_current_preview()
 
     def load_last_working_directory(self):
         try:
@@ -248,12 +213,14 @@ class BasePPTGridEditor(tk.Frame):
             widget.destroy()
         self.thumbnails.clear()
         self.selected_indices.clear()
+        self.carousel_index = 0
         self.last_clicked_index = None
         count = self.controller.get_slide_count()
         if count == 0:
             ttk.Label(self.inner, text="Slayt yok").pack()
             self.preview_label.config(image="", text="Slayt yok")
             self.preview_info_label.config(text="Slayt yok")
+            self._update_carousel_buttons()
             return
         cols = 3
         thumb_size = 220
@@ -288,19 +255,39 @@ class BasePPTGridEditor(tk.Frame):
 
         self.inner.update_idletasks()
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        # En son seçili indeks varsa onu göster, yoksa 0
-        if self._current_preview_index is not None and self._current_preview_index < count:
-            self._update_large_preview(self._current_preview_index)
+        if self.selected_indices:
+            self.carousel_index = 0
+            self._update_current_preview()
         elif count > 0:
-            self._update_large_preview(0)
+            self.selected_indices = [0]
+            self.carousel_index = 0
+            self._update_current_preview()
+        self._update_carousel_buttons()
 
     def _on_checkbutton_click(self, idx):
         if idx in self.selected_indices:
-            self._select_single(idx, False)
+            self.selected_indices.remove(idx)
+            # remove from thumbnails visual
         else:
-            self._select_single(idx, True)
+            self.selected_indices.append(idx)
+            self.selected_indices.sort()
+        # update checkbox vars
+        for photo, var, i in self.thumbnails:
+            var.set(i in self.selected_indices)
+        # carousel index: if selection not empty, set to last added/removed? simpler: set to 0
+        if self.selected_indices:
+            if idx in self.selected_indices:
+                # move carousel to this index if it was added
+                self.carousel_index = self.selected_indices.index(idx)
+            else:
+                # if removed, adjust index
+                if self.carousel_index >= len(self.selected_indices):
+                    self.carousel_index = max(0, len(self.selected_indices)-1)
+        else:
+            self.carousel_index = 0
+        self._update_current_preview()
+        self._update_carousel_buttons()
         self.last_clicked_index = idx
-        self._update_large_preview(idx)
 
     def _on_slide_click(self, event, idx):
         shift_pressed = (event.state & 0x0001) != 0
@@ -309,55 +296,81 @@ class BasePPTGridEditor(tk.Frame):
             end = max(self.last_clicked_index, idx)
             for i in range(start, end+1):
                 if i not in self.selected_indices:
-                    self._select_single(i, True)
-            self.last_clicked_index = idx
+                    self.selected_indices.append(i)
+            self.selected_indices.sort()
+            # update checkboxes
+            for photo, var, i in self.thumbnails:
+                var.set(i in self.selected_indices)
+            self.carousel_index = 0
+            self._update_current_preview()
+            self._update_carousel_buttons()
         else:
-            if idx in self.selected_indices:
-                self._select_single(idx, False)
-            else:
-                self._select_single(idx, True)
-            self.last_clicked_index = idx
-        self._update_large_preview(idx)
-
-    def _select_single(self, idx, select):
-        if select:
-            if idx not in self.selected_indices:
-                self.selected_indices.append(idx)
-        else:
+            # Toggle single selection (like checkbutton)
             if idx in self.selected_indices:
                 self.selected_indices.remove(idx)
-        if idx < len(self.thumbnails):
-            var = self.thumbnails[idx][1]
-            var.set(select)
+            else:
+                self.selected_indices.append(idx)
+                self.selected_indices.sort()
+            # update checkbox
+            for photo, var, i in self.thumbnails:
+                var.set(i in self.selected_indices)
+            if self.selected_indices:
+                # set carousel index to this slide if it's now selected
+                if idx in self.selected_indices:
+                    self.carousel_index = self.selected_indices.index(idx)
+                else:
+                    # if removed and carousel index out of range
+                    if self.carousel_index >= len(self.selected_indices):
+                        self.carousel_index = max(0, len(self.selected_indices)-1)
+            else:
+                self.carousel_index = 0
+            self._update_current_preview()
+            self._update_carousel_buttons()
+        self.last_clicked_index = idx
 
-    def _update_large_preview(self, slide_index):
-        """Seçili slaydın büyük önizlemesini sağ panelde göster, label boyutuna sığdır."""
-        if self.controller is None:
+    def _update_current_preview(self):
+        if not self.controller:
             return
-        try:
-            # Orijinal görseli al (yüksek kaliteli, max 800px genişlik)
-            img = self.controller.get_slide_preview(slide_index, max_size=800)
-            if img:
-                # Label'ın mevcut boyutunu al
+        if not self.selected_indices:
+            self.preview_label.config(image="", text="Slayt seçilmedi")
+            self.preview_info_label.config(text="Slayt seçilmedi")
+            return
+        slide_idx = self.selected_indices[self.carousel_index]
+        img = self.controller.get_slide_preview(slide_idx, max_size=800)
+        if img:
+            try:
                 label_width = self.preview_label.winfo_width()
                 label_height = self.preview_label.winfo_height()
                 if label_width > 1 and label_height > 1:
-                    # Görseli label'a sığacak şekilde yeniden boyutlandır (oran korunarak)
                     img.thumbnail((label_width, label_height), Image.Resampling.LANCZOS)
                 photo = ImageTk.PhotoImage(img)
                 self.preview_label.config(image=photo)
                 self.preview_label.image = photo
-                self.preview_info_label.config(text=f"Slayt {slide_index+1} - {img.width}x{img.height}")
-                self._current_preview_image = img
-                self._current_preview_index = slide_index
-            else:
-                self.preview_label.config(image="", text="Görsel yok")
-                self.preview_info_label.config(text=f"Slayt {slide_index+1} - Görsel yok")
-                self._current_preview_image = None
-                self._current_preview_index = None
-        except Exception as e:
-            self.preview_label.config(image="", text="Hata")
-            self.preview_info_label.config(text=f"Hata: {str(e)[:50]}")
+                self.preview_info_label.config(text=f"Slayt {slide_idx+1} - {img.width}x{img.height}")
+            except Exception:
+                self.preview_label.config(image="", text="Görsel yüklenemedi")
+        else:
+            self.preview_label.config(image="", text="Görsel yok")
+            self.preview_info_label.config(text=f"Slayt {slide_idx+1} - Görsel yok")
+        self.carousel_counter.config(text=f"{self.carousel_index+1} / {len(self.selected_indices)}")
+
+    def _update_carousel_buttons(self):
+        if len(self.selected_indices) > 1:
+            self.btn_prev.config(state=tk.NORMAL)
+            self.btn_next.config(state=tk.NORMAL)
+        else:
+            self.btn_prev.config(state=tk.DISABLED)
+            self.btn_next.config(state=tk.DISABLED)
+
+    def _carousel_prev(self):
+        if len(self.selected_indices) > 1:
+            self.carousel_index = (self.carousel_index - 1) % len(self.selected_indices)
+            self._update_current_preview()
+
+    def _carousel_next(self):
+        if len(self.selected_indices) > 1:
+            self.carousel_index = (self.carousel_index + 1) % len(self.selected_indices)
+            self._update_current_preview()
 
     def delete_selected(self):
         if not self.selected_indices:
@@ -370,10 +383,6 @@ class BasePPTGridEditor(tk.Frame):
             self.controller.save(self.current_pptx_path)
             self.status_label.config(text="Silme tamamlandı, slaytlar güncellendi.")
             self.refresh_slides()
-            # Silme işleminden sonra kalan slaytlardan birini seç (ilk slayt)
-            if self.controller.get_slide_count() > 0:
-                self._select_single(0, True)
-                self._update_large_preview(0)
         except Exception as e:
             messagebox.showerror("Hata", str(e))
             self.status_label.config(text="Hata oluştu")
@@ -385,15 +394,17 @@ class BasePPTGridEditor(tk.Frame):
         try:
             self.status_label.config(text="Birleştiriliyor...")
             self.update_idletasks()
-            new_slide_index = min(self.selected_indices)  # grid slayt buraya gelecek
+            new_slide_index = min(self.selected_indices)
             self.controller.apply_grid(self.selected_indices, margin=DEFAULT_GRID_MARGIN_PX)
             self.controller.save(self.current_pptx_path)
             self.status_label.config(text="Birleştirme tamamlandı, slaytlar güncellendi.")
             self.refresh_slides()
-            # Yeni grid slaydı seç ve göster
-            if self.controller.get_slide_count() > 0 and new_slide_index < self.controller.get_slide_count():
-                self._select_single(new_slide_index, True)
-                self._update_large_preview(new_slide_index)
+            # select the new grid slide
+            self.selected_indices = [new_slide_index]
+            self.carousel_index = 0
+            self._update_current_preview()
+            self._update_carousel_buttons()
+            self.thumbnails_update_checkboxes()
         except Exception as e:
             messagebox.showerror("Hata", str(e))
             self.status_label.config(text="Hata oluştu")
@@ -402,6 +413,7 @@ class BasePPTGridEditor(tk.Frame):
         if not self.selected_indices:
             messagebox.showerror("Hata", "Yükseltilecek slayt seçin")
             return
+        # disable buttons
         self.btn_upgrade.config(state=tk.DISABLED)
         self.btn_grid.config(state=tk.DISABLED)
         self.btn_delete.config(state=tk.DISABLED)
@@ -433,8 +445,7 @@ class BasePPTGridEditor(tk.Frame):
                 self.controller.save(self.current_pptx_path)
                 self.after(0, self._upgrade_finished_success)
             except Exception as e:
-                error_msg = str(e)
-                self.after(0, lambda: self._upgrade_finished_error(error_msg))
+                self.after(0, lambda: self._upgrade_finished_error(str(e)))
 
         threading.Thread(target=task, daemon=True).start()
 
@@ -442,17 +453,8 @@ class BasePPTGridEditor(tk.Frame):
         self.status_label.config(text="Yükseltme tamamlandı, slaytlar güncellendi.")
         self.refresh_slides()
         self._enable_buttons()
-        # Yükseltilen slaytlardan ilkini seç ve göster
-        if self.selected_indices and self.controller.get_slide_count() > 0:
-            first = self.selected_indices[0]
-            self._select_single(first, True)
-            self._update_large_preview(first)
-        else:
-            # hiç seçili yoksa ilk slaydı seç
-            if self.controller.get_slide_count() > 0:
-                self._select_single(0, True)
-                self._update_large_preview(0)
-        self.selected_indices.clear()
+        # Keep selection as is? The upgrade doesn't change indices, just images
+        self._update_current_preview()
         messagebox.showinfo("Tamamlandı", "Seçili slaytlar yüksek kaliteye yükseltildi.")
 
     def _upgrade_finished_error(self, error_msg):
@@ -473,18 +475,21 @@ class BasePPTGridEditor(tk.Frame):
             self.controller.save(self.current_pptx_path)
             self.status_label.config(text="GIF slayt oluşturuldu.")
             self.refresh_slides()
+            # select the new GIF slide
+            self.selected_indices = [new_index]
+            self.carousel_index = 0
+            self._update_current_preview()
+            self._update_carousel_buttons()
+            self.thumbnails_update_checkboxes()
             self._enable_buttons()
-            # GIF oluşturulan slaydı seç
-            if self.controller.get_slide_count() > 0 and new_index < self.controller.get_slide_count():
-                self._select_single(new_index, True)
-                self._update_large_preview(new_index)
-            messagebox.showinfo("Tamamlandı", 
-                "GIF animasyonu başarıyla slayta eklendi.\n\n"
-                "Slayt gösterisi başladığında GIF otomatik olarak dönecektir.\n"
-                "Not: PowerPoint'te GIF'in döngüye girmesi için herhangi bir ek ayar gerekmez.")
+            messagebox.showinfo("Tamamlandı", "GIF animasyonu başarıyla slayta eklendi.")
         except Exception as e:
             messagebox.showerror("Hata", str(e))
             self._enable_buttons()
+
+    def thumbnails_update_checkboxes(self):
+        for photo, var, idx in self.thumbnails:
+            var.set(idx in self.selected_indices)
 
     def set_pptx_and_video(self, pptx_path, video_path):
         self.temp_video_path = video_path
