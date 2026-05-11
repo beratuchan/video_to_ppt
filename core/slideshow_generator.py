@@ -1,3 +1,4 @@
+# core/slideshow_generator.py
 import time
 from typing import Optional
 from domain.i_video_stream import IVideoStream
@@ -7,6 +8,7 @@ from domain.i_progress_reporter import IProgressReporter
 from domain.i_frame_sampler import IFrameSampler
 from strategies.frame_sampling.every_frame_sampler import EveryFrameSampler
 from config.settings import MIN_SLIDE_INTERVAL_SEC, PROGRESS_UPDATE_INTERVAL_FRAMES
+from core.frame_processing_engine import FrameProcessingEngine   # YENİ
 
 class SlideshowGenerator:
     def __init__(
@@ -47,14 +49,23 @@ class SlideshowGenerator:
             if self.add_first_slide_with_link:
                 self._add_first_slide(title)
 
-            scene_count, elapsed = self._process_frames(duration, fps, title)
+            # YENİ: FrameProcessingEngine kullan
+            engine = FrameProcessingEngine(
+                video_stream=self.video_stream,
+                scene_detector=self.scene_detector,
+                slide_builder=self.slide_builder,
+                frame_sampler=self.frame_sampler,
+                min_slide_interval=self.min_slide_interval,
+                progress_callback=self._progress_callback
+            )
+            scene_count, elapsed = engine.process(duration, fps, title)
 
             self._notify_progress(100, f"Tamamlandı! {scene_count} slayt, {elapsed:.1f} saniye")
             return self.slide_builder.build()
         except Exception as e:
             error_msg = str(e)
             self._notify_error(error_msg)
-            raise   # yine de fırlat, üst katman da yakalayabilir
+            raise
 
     def _add_first_slide(self, title: str) -> None:
         self.slide_builder.create_new_slide()
@@ -62,36 +73,9 @@ class SlideshowGenerator:
         self.slide_builder.add_text(f"Video URL: {url}", font_size=18, bold=False)
         self.slide_builder.add_timestamp(0, title)
 
-    def _process_frames(self, duration: float, fps: float, title: str) -> tuple[int, float]:
-        prev_frame = None
-        frame_index = 0
-        scene_count = 0
-        last_slide_time = -self.min_slide_interval
-        start_time = time.time()
-
-        while True:
-            frame = self.video_stream.get_frame()
-            if frame is None:
-                break
-
-            current_sec = frame_index / fps
-            if self.frame_sampler.should_sample(frame_index, frame, current_sec):
-                if self.scene_detector.is_scene_change(prev_frame, frame):
-                    if (current_sec - last_slide_time) >= self.min_slide_interval:
-                        self.slide_builder.create_new_slide()
-                        self.slide_builder.add_image(frame)
-                        self.slide_builder.add_timestamp(current_sec, title)
-                        scene_count += 1
-                        last_slide_time = current_sec
-                prev_frame = frame
-
-            frame_index += 1
-            if frame_index % PROGRESS_UPDATE_INTERVAL_FRAMES == 0 and duration > 0:
-                percent = min(100.0, (frame_index / (duration * fps)) * 100.0)
-                self._notify_progress(percent, f"İşleniyor... ({scene_count} slayt)")
-
-        elapsed = time.time() - start_time
-        return scene_count, elapsed
+    def _progress_callback(self, percent: float, message: str, scene_count: int) -> None:
+        """FrameProcessingEngine'den gelen ilerleme bildirimlerini observer'a iletir."""
+        self._notify_progress(percent, message)
 
     def _notify_progress(self, percent: float, message: str) -> None:
         if self.observer:

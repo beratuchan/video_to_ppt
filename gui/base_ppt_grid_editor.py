@@ -1,3 +1,4 @@
+# gui/base_ppt_grid_editor.py (tam dosya, SRP düzenlemeleri uygulanmış)
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import json
@@ -8,8 +9,6 @@ from infrastructure.python_pptx_reader import PythonPPTXReader
 from infrastructure.python_pptx_writer import PythonPPTXWriter
 from infrastructure.grid_composer import PillowGridComposer
 from gui.ppt_grid_controller import PPTGridController
-from utils.url_resolver import resolve_video_url
-from infrastructure.high_res_frame_extractor import HighResFrameExtractor
 from config.settings import DEFAULT_GRID_MARGIN_PX, DEFAULT_UPGRADE_TARGET_WIDTH
 
 class BasePPTGridEditor(tk.Frame):
@@ -267,20 +266,15 @@ class BasePPTGridEditor(tk.Frame):
     def _on_checkbutton_click(self, idx):
         if idx in self.selected_indices:
             self.selected_indices.remove(idx)
-            # remove from thumbnails visual
         else:
             self.selected_indices.append(idx)
             self.selected_indices.sort()
-        # update checkbox vars
         for photo, var, i in self.thumbnails:
             var.set(i in self.selected_indices)
-        # carousel index: if selection not empty, set to last added/removed? simpler: set to 0
         if self.selected_indices:
             if idx in self.selected_indices:
-                # move carousel to this index if it was added
                 self.carousel_index = self.selected_indices.index(idx)
             else:
-                # if removed, adjust index
                 if self.carousel_index >= len(self.selected_indices):
                     self.carousel_index = max(0, len(self.selected_indices)-1)
         else:
@@ -298,28 +292,23 @@ class BasePPTGridEditor(tk.Frame):
                 if i not in self.selected_indices:
                     self.selected_indices.append(i)
             self.selected_indices.sort()
-            # update checkboxes
             for photo, var, i in self.thumbnails:
                 var.set(i in self.selected_indices)
             self.carousel_index = 0
             self._update_current_preview()
             self._update_carousel_buttons()
         else:
-            # Toggle single selection (like checkbutton)
             if idx in self.selected_indices:
                 self.selected_indices.remove(idx)
             else:
                 self.selected_indices.append(idx)
                 self.selected_indices.sort()
-            # update checkbox
             for photo, var, i in self.thumbnails:
                 var.set(i in self.selected_indices)
             if self.selected_indices:
-                # set carousel index to this slide if it's now selected
                 if idx in self.selected_indices:
                     self.carousel_index = self.selected_indices.index(idx)
                 else:
-                    # if removed and carousel index out of range
                     if self.carousel_index >= len(self.selected_indices):
                         self.carousel_index = max(0, len(self.selected_indices)-1)
             else:
@@ -399,7 +388,6 @@ class BasePPTGridEditor(tk.Frame):
             self.controller.save(self.current_pptx_path)
             self.status_label.config(text="Birleştirme tamamlandı, slaytlar güncellendi.")
             self.refresh_slides()
-            # select the new grid slide
             self.selected_indices = [new_slide_index]
             self.carousel_index = 0
             self._update_current_preview()
@@ -409,52 +397,52 @@ class BasePPTGridEditor(tk.Frame):
             messagebox.showerror("Hata", str(e))
             self.status_label.config(text="Hata oluştu")
 
+    # ----- GÜNCELLENMİŞ upgrade_selected METODU -----
     def upgrade_selected(self):
         if not self.selected_indices:
             messagebox.showerror("Hata", "Yükseltilecek slayt seçin")
             return
-        # disable buttons
+        
+        # Butonları devre dışı bırak
         self.btn_upgrade.config(state=tk.DISABLED)
         self.btn_grid.config(state=tk.DISABLED)
         self.btn_delete.config(state=tk.DISABLED)
         self.btn_gif.config(state=tk.DISABLED)
-
+        
         total = len(self.selected_indices)
         self.status_label.config(text=f"Yüksek kaliteli kareler alınıyor (0/{total})...")
         self.update_idletasks()
-
-        youtube_url = self.controller.get_video_url_from_first_slide()
-        if not youtube_url:
-            messagebox.showerror("Hata", "İlk slaytta video URL'si bulunamadı")
-            self._enable_buttons()
-            return
-        video_stream_url = resolve_video_url(youtube_url)
-        if not video_stream_url:
-            messagebox.showerror("Hata", "Video akış URL'si alınamadı")
-            self._enable_buttons()
-            return
-        extractor = HighResFrameExtractor(video_stream_url)
-
+        
+        # Controller'ın yeni metodunu kullan (video URL çözme ve extractor oluşturma işi controller'a taşındı)
         def task():
             try:
-                def progress_callback(current, total, slide_idx):
+                def progress_cb(current, total, slide_idx):
                     self.after(0, lambda: self.status_label.config(
                         text=f"Yüksek kaliteli kareler alınıyor ({current+1}/{total}) - Slayt {slide_idx+1}..."
                     ))
-                self.controller.upgrade_slides(self.selected_indices, extractor, target_width=DEFAULT_UPGRADE_TARGET_WIDTH, progress_callback=progress_callback)
+                def status_cb(msg):
+                    self.after(0, lambda: self.status_label.config(text=msg))
+                
+                self.controller.upgrade_selected_slides(
+                    self.selected_indices,
+                    target_width=DEFAULT_UPGRADE_TARGET_WIDTH,
+                    progress_callback=progress_cb,
+                    status_callback=status_cb
+                )
                 self.controller.save(self.current_pptx_path)
                 self.after(0, self._upgrade_finished_success)
             except Exception as e:
                 self.after(0, lambda: self._upgrade_finished_error(str(e)))
-
+        
         threading.Thread(target=task, daemon=True).start()
 
     def _upgrade_finished_success(self):
         self.status_label.config(text="Yükseltme tamamlandı, slaytlar güncellendi.")
         self.refresh_slides()
         self._enable_buttons()
-        # Keep selection as is? The upgrade doesn't change indices, just images
-        self._update_current_preview()
+        for _, var, _ in self.thumbnails:
+            var.set(False)
+        self.selected_indices.clear()
         messagebox.showinfo("Tamamlandı", "Seçili slaytlar yüksek kaliteye yükseltildi.")
 
     def _upgrade_finished_error(self, error_msg):
@@ -475,7 +463,6 @@ class BasePPTGridEditor(tk.Frame):
             self.controller.save(self.current_pptx_path)
             self.status_label.config(text="GIF slayt oluşturuldu.")
             self.refresh_slides()
-            # select the new GIF slide
             self.selected_indices = [new_index]
             self.carousel_index = 0
             self._update_current_preview()

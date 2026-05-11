@@ -11,6 +11,9 @@ from services.slide_upgrader import SlideUpgrader
 from services.gif_animator import GifAnimator
 from services.grid_composer_service import GridComposerService
 from domain.i_frame_extractor import IFrameExtractor
+from infrastructure.high_res_frame_extractor import HighResFrameExtractor
+from utils.url_resolver import resolve_video_url
+from config.settings import DEFAULT_UPGRADE_TARGET_WIDTH
 import re
 import cv2
 import numpy as np
@@ -65,19 +68,45 @@ class PPTGridController:
         match = re.search(r'Video URL:\s*(https?://[^\s]+)', text)
         return match.group(1) if match else None
 
-    # ========== YENİ METODLAR (F5 Carousel için) ==========
+    # ========== YENİ METODLAR (SRP için UI'dan taşınan iş mantığı) ==========
+    def upgrade_selected_slides(
+        self,
+        selected_indices: List[int],
+        target_width: int = DEFAULT_UPGRADE_TARGET_WIDTH,
+        progress_callback: Optional[Callable[[int, int, int], None]] = None,
+        status_callback: Optional[Callable[[str], None]] = None
+    ) -> None:
+        """
+        Seçili slaytları, ilk slayttaki video URL'sini kullanarak yüksek kaliteye yükseltir.
+        progress_callback: (current_index, total, slide_index)
+        status_callback: (message) -> UI durum mesajlarını güncellemek için
+        """
+        youtube_url = self.get_video_url_from_first_slide()
+        if not youtube_url:
+            raise ValueError("İlk slaytta video URL'si bulunamadı")
+        
+        if status_callback:
+            status_callback("Video akış URL'si alınıyor...")
+        
+        video_stream_url = resolve_video_url(youtube_url)
+        if not video_stream_url:
+            raise ValueError("Video akış URL'si alınamadı")
+        
+        extractor = HighResFrameExtractor(video_stream_url)
+        
+        # Yükseltme işlemini çağır (bu işlem kilit altında yapılır, ancak uzun sürebilir)
+        # Not: Dışarıda threading yönetimi yapılması gerekebilir. Bu metot doğrudan çağrıldığında UI donar.
+        # UI tarafı bu metodu bir thread içinde çağırmalıdır.
+        self.upgrade_slides(selected_indices, extractor, target_width, progress_callback)
+
     def get_slide_time_range(self, slide_index: int, total_duration: float = None) -> Tuple[float, float]:
         """
         Belirtilen slaydın zaman aralığını döndürür: (start_sec, end_sec)
-        start_sec: bir önceki slaydın zamanı (veya 0)
-        end_sec: bir sonraki slaydın zamanı (veya total_duration)
-        total_duration: son slayt için gerekli, eğer None verilmezse videonun gerçek süresi bilinmiyorsa büyük sayı verilir.
         """
         count = self.get_slide_count()
         if slide_index < 0 or slide_index >= count:
             raise ValueError("Geçersiz slayt indeksi")
         
-        # Önceki slaytın zamanını al
         if slide_index > 0:
             prev_text = self.reader.get_slide_text(slide_index - 1)
             prev_sec = self._extract_timestamp_from_text(prev_text)
@@ -86,7 +115,6 @@ class PPTGridController:
         else:
             prev_sec = 0.0
         
-        # Sonraki slaytın zamanını al
         if slide_index < count - 1:
             next_text = self.reader.get_slide_text(slide_index + 1)
             next_sec = self._extract_timestamp_from_text(next_text)
@@ -98,7 +126,6 @@ class PPTGridController:
         return (prev_sec, next_sec)
     
     def _extract_timestamp_from_text(self, text: str) -> Optional[float]:
-        """Slayt metninden MM:SS:mmm formatında zaman damgasını çıkarır."""
         match = re.search(r'(\d{2}):(\d{2}):(\d{3})', text)
         if match:
             minutes = int(match.group(1))
@@ -108,10 +135,8 @@ class PPTGridController:
         return None
 
     def replace_slide_with_frame(self, slide_index: int, frame_bgr: np.ndarray) -> None:
-        """Slayttaki mevcut resmi, verilen BGR frame ile değiştirir."""
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         pil_img = Image.fromarray(rgb)
-        
         with self._lock:
             self.writer.replace_slide_image(slide_index, pil_img)
             self.reader.update_from_writer(self.writer)
