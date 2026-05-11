@@ -20,7 +20,8 @@ class SlideshowGenerator:
         frame_queue_size: int = 30,
         add_first_slide_with_link: bool = False,
         temp_video_path: str = None,
-        downloader=None
+        downloader=None,
+        video_url: Optional[str] = None
     ):
         self.video_stream = video_stream
         self.scene_detector = scene_detector
@@ -31,28 +32,34 @@ class SlideshowGenerator:
         self.add_first_slide_with_link = add_first_slide_with_link
         self.temp_video_path = temp_video_path
         self.downloader = downloader
+        self.video_url = video_url
 
     def generate_slideshow(self) -> str:
-        video_info = self.video_stream.get_info()
-        duration = video_info.get('duration_seconds', 0)
-        title = video_info.get('title', 'Video')
-        fps = video_info.get('fps', 1)
+        try:
+            video_info = self.video_stream.get_info()
+            duration = video_info.get('duration_seconds', 0)
+            title = video_info.get('title', 'Video')
+            fps = video_info.get('fps', 1)
 
-        self.frame_sampler.reset()
-        self._notify(0, "Video işleniyor...")
+            self.frame_sampler.reset()
+            self._notify_progress(0, "Video işleniyor...")
 
-        if self.add_first_slide_with_link:
-            self._add_first_slide(title)
+            if self.add_first_slide_with_link:
+                self._add_first_slide(title)
 
-        scene_count, elapsed = self._process_frames(duration, fps, title)
+            scene_count, elapsed = self._process_frames(duration, fps, title)
 
-        self._notify(100, f"Tamamlandı! {scene_count} slayt, {elapsed:.1f} saniye")
-        return self.slide_builder.build()
+            self._notify_progress(100, f"Tamamlandı! {scene_count} slayt, {elapsed:.1f} saniye")
+            return self.slide_builder.build()
+        except Exception as e:
+            error_msg = str(e)
+            self._notify_error(error_msg)
+            raise   # yine de fırlat, üst katman da yakalayabilir
 
     def _add_first_slide(self, title: str) -> None:
         self.slide_builder.create_new_slide()
-        video_url = getattr(self.video_stream, 'url', 'Bilinmiyor')
-        self.slide_builder.add_text(f"Video URL: {video_url}", font_size=18, bold=False)
+        url = self.video_url if self.video_url else "Bilinmiyor"
+        self.slide_builder.add_text(f"Video URL: {url}", font_size=18, bold=False)
         self.slide_builder.add_timestamp(0, title)
 
     def _process_frames(self, duration: float, fps: float, title: str) -> tuple[int, float]:
@@ -81,11 +88,15 @@ class SlideshowGenerator:
             frame_index += 1
             if frame_index % PROGRESS_UPDATE_INTERVAL_FRAMES == 0 and duration > 0:
                 percent = min(100.0, (frame_index / (duration * fps)) * 100.0)
-                self._notify(percent, f"İşleniyor... ({scene_count} slayt)")
+                self._notify_progress(percent, f"İşleniyor... ({scene_count} slayt)")
 
         elapsed = time.time() - start_time
         return scene_count, elapsed
 
-    def _notify(self, percent: float, message: str) -> None:
+    def _notify_progress(self, percent: float, message: str) -> None:
         if self.observer:
             self.observer.on_progress(percent, message)
+
+    def _notify_error(self, error_msg: str) -> None:
+        if self.observer:
+            self.observer.on_error(self.video_url, error_msg)

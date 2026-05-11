@@ -19,6 +19,9 @@ class LocalVideoStream(IVideoStream):
         self._frame_index = 0
         self._total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
+        # Efektif FPS = orijinal FPS / frame_interval
+        self._effective_fps = self._orig_fps / self._frame_interval
+
         # İlk frame'i okuyarak gerçek yüksekliği hesapla (target_width'e göre ölçeklenmiş)
         ret, first_frame = self.cap.read()
         if ret:
@@ -53,7 +56,7 @@ class LocalVideoStream(IVideoStream):
             'duration_seconds': duration,
             'width': self.target_width,
             'height': self._actual_height,
-            'fps': self.target_fps,
+            'fps': self._effective_fps,      # DÜZELTİLDİ: efektif FPS döndürülüyor
         }
 
     def close(self):

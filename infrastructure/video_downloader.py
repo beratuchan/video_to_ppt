@@ -2,7 +2,7 @@ import yt_dlp
 import tempfile
 import os
 import time
-from typing import List, Optional
+from typing import List, Optional, Callable
 from domain.i_download_strategy import IDownloadStrategy
 from strategies.download import BestMp4Strategy, BestVideoPlusAudioStrategy, BestAnyStrategy
 from utils.ffmpeg_utils import get_ffmpeg_path
@@ -19,11 +19,23 @@ class VideoDownloader:
             ]
         self.strategies = strategies
 
-    def download(self, url: str) -> str:
+    def download(self, url: str, progress_callback: Optional[Callable[[Optional[float], str], None]] = None, permanent_path: Optional[str] = None) -> str:
+        """
+        Videoyu indirir.
+        :param progress_callback: (percent, message) -> None. percent None ise sadece mesaj.
+        :param permanent_path: Belirtilirse dosya bu yola kaydedilir (geçici değil)
+        """
         last_exception = None
         for strategy in self.strategies:
-            fd, path = tempfile.mkstemp(suffix='.mp4')
-            os.close(fd)
+            # Dosya yolunu belirle
+            if permanent_path:
+                path = permanent_path
+                # Eğer dosya zaten varsa üzerine yazmadan önce temizle
+                if os.path.exists(path):
+                    os.unlink(path)
+            else:
+                fd, path = tempfile.mkstemp(suffix='.mp4')
+                os.close(fd)
 
             ydl_opts = {
                 'format': strategy.get_format_spec(),
@@ -31,7 +43,7 @@ class VideoDownloader:
                 'ffmpeg_location': self.ffmpeg_path,
                 'quiet': False,
                 'no_warnings': False,
-                'progress_hooks': [self._progress_hook],
+                'progress_hooks': [self._make_progress_hook(progress_callback)],
                 'retries': 10,
                 'fragment_retries': 10,
                 'merge_output_format': 'mp4',
@@ -48,14 +60,15 @@ class VideoDownloader:
                 time.sleep(0.5)
                 if os.path.exists(path) and os.path.getsize(path) > 0:
                     print(f"[Download] Başarılı: {path} ({os.path.getsize(path)} bytes)")
-                    self.temp_file = path
+                    if not permanent_path:
+                        self.temp_file = path
                     return path
                 else:
                     raise RuntimeError("Dosya boş oluştu")
             except Exception as e:
                 last_exception = e
                 print(f"[Download] {strategy.get_name()} başarısız: {e}")
-                if os.path.exists(path):
+                if os.path.exists(path) and not permanent_path:
                     os.unlink(path)
                 continue
 
@@ -64,13 +77,26 @@ class VideoDownloader:
         else:
             raise RuntimeError("Video indirilemedi: Bilinmeyen hata")
 
-    def _progress_hook(self, d):
-        if d['status'] == 'downloading':
-            if d.get('total_bytes'):
-                percent = d['downloaded_bytes'] / d['total_bytes'] * 100
-                print(f"\rİndirme: %{percent:.1f}", end='')
-        elif d['status'] == 'finished':
-            print("\nİndirme tamamlandı, işleniyor...")
+    def _make_progress_hook(self, callback: Optional[Callable[[Optional[float], str], None]]):
+        def progress_hook(d):
+            if d['status'] == 'downloading':
+                if d.get('total_bytes'):
+                    percent = d['downloaded_bytes'] / d['total_bytes'] * 100
+                    msg = f"İndiriliyor: %{percent:.1f}"
+                    print(f"\r{msg}", end='')
+                    if callback:
+                        callback(percent, msg)
+                else:
+                    # total_bytes yoksa (canlı akış gibi) sadece mesaj
+                    downloaded = d.get('downloaded_bytes', 0)
+                    msg = f"İndiriliyor: {downloaded // 1024} KB"
+                    if callback:
+                        callback(None, msg)
+            elif d['status'] == 'finished':
+                print("\nİndirme tamamlandı, işleniyor...")
+                if callback:
+                    callback(100, "İndirme tamamlandı, işleniyor...")
+        return progress_hook
 
     def cleanup(self):
         if self.temp_file and os.path.exists(self.temp_file):

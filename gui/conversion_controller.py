@@ -19,19 +19,19 @@ class ConversionController:
     def is_running(self) -> bool:
         return self.executor.is_running
 
-    def start(self, url_list: List[str]) -> None:
+    def start(self, url_list: List[str], keep_video: bool = False) -> None:
         if self.executor.is_running:
             self.dispatcher.error(None, "Zaten bir dönüştürme işlemi devam ediyor.")
             return
         if not url_list:
             self.dispatcher.error(None, "İşlenecek URL yok.")
             return
-        self.executor.start(target=self._process_urls, args=(url_list,))
+        self.executor.start(target=self._process_urls, args=(url_list, keep_video))
 
     def stop(self) -> None:
         self.executor.stop()
 
-    def _process_urls(self, url_list: List[str]) -> None:
+    def _process_urls(self, url_list: List[str], keep_video: bool) -> None:
         success_count = 0
         errors = []
         total = len(url_list)
@@ -45,7 +45,8 @@ class ConversionController:
             self.dispatcher.progress(percent, f"({idx+1}/{total}) İşleniyor: {url}")
 
             try:
-                generator = self.factory.create(url, observer=self.notifier)
+                # keep_video parametresini factory'ye ilet
+                generator = self.factory.create(url, observer=self.notifier, keep_video=keep_video)
                 pptx_path = generator.generate_slideshow()
                 self.dispatcher.result(url, pptx_path)
                 self.dispatcher.open_editor(pptx_path, generator.temp_video_path)
