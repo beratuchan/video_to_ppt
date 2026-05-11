@@ -1,18 +1,19 @@
 import queue
-import threading
 from typing import List, Optional
 from core.slideshow_generator import SlideshowGenerator
 from core.progress_notifier import ProgressNotifier
 from core.background_task_executor import BackgroundTaskExecutor
 from core.message_dispatcher import MessageDispatcher
-from config.di_container import create_generator_for_url
+from domain.i_generator_factory import IGeneratorFactory
+from factories.generator_factory import ConcreteGeneratorFactory
 
 class ConversionController:
-    def __init__(self, msg_queue: queue.Queue):
+    def __init__(self, msg_queue: queue.Queue, factory: Optional[IGeneratorFactory] = None):
         self.msg_queue = msg_queue
         self.dispatcher = MessageDispatcher(msg_queue)
         self.notifier = ProgressNotifier(msg_queue)
         self.executor = BackgroundTaskExecutor()
+        self.factory = factory if factory else ConcreteGeneratorFactory()
 
     @property
     def is_running(self) -> bool:
@@ -44,7 +45,7 @@ class ConversionController:
             self.dispatcher.progress(percent, f"({idx+1}/{total}) İşleniyor: {url}")
 
             try:
-                generator = create_generator_for_url(url, observer=self.notifier)
+                generator = self.factory.create(url, observer=self.notifier)
                 pptx_path = generator.generate_slideshow()
                 self.dispatcher.result(url, pptx_path)
                 self.dispatcher.open_editor(pptx_path, generator.temp_video_path)
