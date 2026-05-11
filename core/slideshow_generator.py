@@ -42,11 +42,20 @@ class SlideshowGenerator:
         self._notify(0, "Video işleniyor...")
 
         if self.add_first_slide_with_link:
-            self.slide_builder.create_new_slide()
-            video_url = getattr(self.video_stream, 'url', 'Bilinmiyor')
-            self.slide_builder.add_text(f"Video URL: {video_url}", font_size=18, bold=False)
-            self.slide_builder.add_timestamp(0, title)
+            self._add_first_slide(title)
 
+        scene_count, elapsed = self._process_frames(duration, fps, title)
+
+        self._notify(100, f"Tamamlandı! {scene_count} slayt, {elapsed:.1f} saniye")
+        return self.slide_builder.build()
+    
+    def _add_first_slide(self, title: str) -> None:
+        self.slide_builder.create_new_slide()
+        video_url = getattr(self.video_stream, 'url', 'Bilinmiyor')
+        self.slide_builder.add_text(f"Video URL: {video_url}", font_size=18, bold=False)
+        self.slide_builder.add_timestamp(0, title)
+
+    def _process_frames(self, duration: float, fps: float, title: str) -> tuple[int, float]:
         prev_frame = None
         frame_index = 0
         scene_count = 0
@@ -75,8 +84,7 @@ class SlideshowGenerator:
                 self._notify(percent, f"İşleniyor... ({scene_count} slayt)")
 
         elapsed = time.time() - start_time
-        self._notify(100, f"Tamamlandı! {scene_count} slayt, {elapsed:.1f} saniye")
-        return self.slide_builder.build()
+        return scene_count, elapsed
 
     def _notify(self, percent: float, message: str) -> None:
         if self.observer:
