@@ -50,6 +50,7 @@ class VideoDownloader:
                 'overwrites': True,
                 'continuedl': False,
                 'nooverwrites': False,
+                'noplaylist': True,      # <-- YENİ: playlist indirmeyi engelle
             }
 
             try:
@@ -87,7 +88,6 @@ class VideoDownloader:
                     if callback:
                         callback(percent, msg)
                 else:
-                    # total_bytes yoksa (canlı akış gibi) sadece mesaj
                     downloaded = d.get('downloaded_bytes', 0)
                     msg = f"İndiriliyor: {downloaded // 1024} KB"
                     if callback:

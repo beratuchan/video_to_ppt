@@ -43,7 +43,7 @@ YTDL_OPTS = {
     'extract_flat': False,
     'forcejson': True,
     'compat_opts': ['ejs'],
-    'noplaylist': True,
+    'noplaylist': True,            # <-- YENİ: playlist indirmeyi engelle
 }
 
 # ========== YENİ SABİTLER (Clean Code) ==========
