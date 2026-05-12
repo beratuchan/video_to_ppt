@@ -4,7 +4,7 @@ from domain.i_pptx_reader import IPPTXReader
 from domain.i_pptx_writer import IPPTXWriter
 from domain.i_frame_extractor import IFrameExtractor
 import cv2
-import re
+from utils.time_utils import extract_timestamp_seconds   # YENİ
 
 class SlideUpgrader:
     @staticmethod
@@ -23,7 +23,7 @@ class SlideUpgrader:
             if progress_callback:
                 progress_callback(i, total, idx)
             slide_text = reader.get_slide_text(idx)
-            seconds = SlideUpgrader._extract_timestamp_from_text(slide_text)
+            seconds = extract_timestamp_seconds(slide_text)   # DEĞİŞTİ
             if seconds is None:
                 continue
             high_res_bgr = extractor.extract_frame(seconds, target_width=target_width)
@@ -34,12 +34,3 @@ class SlideUpgrader:
             writer.replace_slide_image(idx, high_res_pil)
         reader.update_from_writer(writer)
 
-    @staticmethod
-    def _extract_timestamp_from_text(text: str) -> Optional[float]:
-        match = re.search(r'(\d{2}):(\d{2}):(\d{3})', text)
-        if match:
-            minutes = int(match.group(1))
-            seconds = int(match.group(2))
-            ms = int(match.group(3))
-            return minutes * 60 + seconds + ms / 1000.0
-        return None

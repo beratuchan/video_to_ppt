@@ -16,6 +16,7 @@ from domain.i_frame_extractor import IFrameExtractor
 from utils.grid_utils import calculate_grid_dimensions
 from utils.url_resolver import resolve_video_url
 from utils.settings_manager import SettingsManager
+from utils.time_utils import extract_timestamp_seconds   # <-- YENİ
 from config.settings import DEFAULT_UPGRADE_TARGET_WIDTH
 
 from services.slide_upgrader import SlideUpgrader
@@ -117,16 +118,6 @@ class PPTGridController:
         match = re.search(r'Video URL:\s*(https?://[^\s]+)', text)
         return match.group(1) if match else None
 
-    def _extract_timestamp_from_text(self, text: str) -> Optional[float]:
-        """Slayt metninden MM:SS:mmm formatında zaman damgasını çıkarır."""
-        match = re.search(r'(\d{2}):(\d{2}):(\d{3})', text)
-        if match:
-            minutes = int(match.group(1))
-            seconds = int(match.group(2))
-            ms = int(match.group(3))
-            return minutes * 60 + seconds + ms / 1000.0
-        return None
-
     def get_slide_interval(self, slide_index: int, total_duration: float = None) -> Tuple[float, float]:
         """
         Bir slaydın kapsadığı video zaman aralığını döndürür.
@@ -137,11 +128,11 @@ class PPTGridController:
             raise ValueError("Geçersiz slayt indeksi")
 
         cur_text = self.reader.get_slide_text(slide_index)
-        cur_sec = self._extract_timestamp_from_text(cur_text)
+        cur_sec = extract_timestamp_seconds(cur_text)          # <-- YENİ
 
         if slide_index > 0:
             prev_text = self.reader.get_slide_text(slide_index - 1)
-            prev_sec = self._extract_timestamp_from_text(prev_text)
+            prev_sec = extract_timestamp_seconds(prev_text)    # <-- YENİ
         else:
             prev_sec = None
 
