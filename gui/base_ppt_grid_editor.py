@@ -13,6 +13,7 @@ from infrastructure.grid_composer import PillowGridComposer
 from gui.ppt_grid_controller import PPTGridController
 from gui.preview_panel import PreviewPanel
 from gui.frame_carousel_widget import FrameCarouselWidget
+from gui.thumbnail_grid_view import ThumbnailGridView
 from utils.url_resolver import resolve_video_url
 from infrastructure.high_res_frame_extractor import HighResFrameExtractor
 from config.settings import DEFAULT_GRID_MARGIN_PX, DEFAULT_UPGRADE_TARGET_WIDTH
@@ -27,7 +28,6 @@ class BasePPTGridEditor(tk.Frame):
     def __init__(self, parent, temp_video_path=None, **kwargs):
         super().__init__(parent, **kwargs)
         self.controller = None
-        self.thumbnails = []          # (photo, var, index)
         self.selected_indices = []    # sorted list
         self.carousel_index = 0       # selected slaytlar içinde gezinme
         self.settings_file = os.path.join(os.path.dirname(__file__), "..", "config", "ppt_grid_settings.json")
@@ -35,6 +35,9 @@ class BasePPTGridEditor(tk.Frame):
         self.pptx_files = []
         self.temp_video_path = temp_video_path
         self.last_clicked_index = None
+
+        # Thumbnail grid yönetimi
+        self.thumbnail_grid = None
 
         # Carousel modu yönetimi
         self.carousel_mode_active = False
@@ -268,10 +271,16 @@ class BasePPTGridEditor(tk.Frame):
 
     # ---- Slayt Listesi ve Önizleme ----
     def refresh_slides(self):
-        # Temizlik
-        for widget in self.inner.winfo_children():
-            widget.destroy()
-        self.thumbnails.clear()
+        # Thumbnail grid'i temizle veya oluştur
+        if self.thumbnail_grid is not None:
+            self.thumbnail_grid.clear()
+        else:
+            self.thumbnail_grid = ThumbnailGridView(
+                self.inner,
+                on_slide_click=self._on_slide_click,
+                get_preview_func=self.controller.get_slide_preview,
+                container=self.inner
+            )
         self.selected_indices.clear()
         self.carousel_index = 0
         self.last_clicked_index = None
@@ -285,47 +294,12 @@ class BasePPTGridEditor(tk.Frame):
             self.btn_change_frame.config(state=tk.DISABLED)
             return
 
-        cols = 3
-        thumb_size = 220
-        for idx in range(count):
-            if idx % cols == 0:
-                row_frame = ttk.Frame(self.inner)
-                row_frame.pack(anchor="w", pady=10)
-
-            slide_frame = tk.Frame(row_frame, relief=tk.RIDGE, borderwidth=1, bg=self.get_slide_frame_bg(), cursor="hand2")
-            slide_frame.pack(side=tk.LEFT, padx=10, pady=5)
-            slide_frame.bind("<Button-1>", lambda e, i=idx: self._on_slide_click(e, i))
-
-            img = self.controller.get_slide_preview(idx, max_size=thumb_size)
-            photo = None
-            if img:
-                photo = ImageTk.PhotoImage(img)
-                label_img = tk.Label(slide_frame, image=photo, bg=self.get_slide_frame_bg())
-                label_img.image = photo
-                label_img.pack(padx=2, pady=2)
-                label_img.bind("<Button-1>", lambda e, i=idx: self._on_slide_click(e, i))
-            else:
-                placeholder = tk.Label(slide_frame, text="[Resim yok]", width=25, height=15, bg='lightgray')
-                placeholder.pack()
-                placeholder.bind("<Button-1>", lambda e, i=idx: self._on_slide_click(e, i))
-
-            lbl_num = tk.Label(slide_frame, text=f"Slayt {idx+1}", font=("Arial", 10, "bold"), bg=self.get_slide_frame_bg())
-            lbl_num.pack()
-            var = tk.BooleanVar()
-            cb = ttk.Checkbutton(slide_frame, variable=var, text="Seç", command=lambda i=idx: self._on_checkbutton_click(i))
-            cb.pack()
-            self.thumbnails.append((photo, var, idx))
+        self.thumbnail_grid.rebuild(count, self.get_slide_frame_bg())
+        self.thumbnail_grid.update_checkboxes(self.selected_indices)
 
         self.inner.update_idletasks()
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
-        # İlk slaytı seç (eğer hiç seçili yoksa)
-        if not self.selected_indices and count > 0:
-            self.selected_indices = [0]
-            self.carousel_index = 0
-        self._update_current_preview()
-        self._update_carousel_buttons()
-        # Kareyi değiştir butonunu aktif et (eğer video URL'si varsa)
         self.btn_change_frame.config(state=tk.NORMAL if self.controller else tk.DISABLED)
 
     def _update_current_preview(self):
@@ -378,10 +352,8 @@ class BasePPTGridEditor(tk.Frame):
         else:
             self.selected_indices.append(idx)
             self.selected_indices.sort()
-        # Checkbox'ları güncelle
-        for photo, var, i in self.thumbnails:
-            var.set(i in self.selected_indices)
-        # Carousel indeksini ayarla
+        if self.thumbnail_grid:
+            self.thumbnail_grid.update_checkboxes(self.selected_indices)
         if self.selected_indices:
             if idx in self.selected_indices:
                 self.carousel_index = self.selected_indices.index(idx)
@@ -403,8 +375,8 @@ class BasePPTGridEditor(tk.Frame):
                 if i not in self.selected_indices:
                     self.selected_indices.append(i)
             self.selected_indices.sort()
-            for photo, var, i in self.thumbnails:
-                var.set(i in self.selected_indices)
+            if self.thumbnail_grid:
+                self.thumbnail_grid.update_checkboxes(self.selected_indices)
             self.carousel_index = 0
             self._update_current_preview()
             self._update_carousel_buttons()
@@ -414,8 +386,8 @@ class BasePPTGridEditor(tk.Frame):
             else:
                 self.selected_indices.append(idx)
                 self.selected_indices.sort()
-            for photo, var, i in self.thumbnails:
-                var.set(i in self.selected_indices)
+            if self.thumbnail_grid:
+                self.thumbnail_grid.update_checkboxes(self.selected_indices)
             if self.selected_indices:
                 if idx in self.selected_indices:
                     self.carousel_index = self.selected_indices.index(idx)
@@ -509,7 +481,6 @@ class BasePPTGridEditor(tk.Frame):
                 self.controller.save(self.current_pptx_path)
                 self.after(0, self._upgrade_finished_success)
             except Exception as e:
-                # DÜZELTME: doğrudan after ile argüman gönder
                 self.after(0, self._upgrade_finished_error, str(e))
 
         threading.Thread(target=task, daemon=True).start()
@@ -571,7 +542,6 @@ class BasePPTGridEditor(tk.Frame):
                 carousel = self.controller.get_frame_carousel(current_slide, progress_callback=progress_cb)
                 self.after(0, lambda: self._show_frame_carousel(carousel, current_slide))
             except Exception as e:
-                # DÜZELTME: doğrudan after ile argüman gönder
                 self.after(0, self._carousel_error, str(e))
 
         threading.Thread(target=task, daemon=True).start()
