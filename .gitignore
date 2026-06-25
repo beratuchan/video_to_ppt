@@ -1,0 +1,14 @@
+venv/
+__pycache__/
+*.py[cod]
+*.ppo
+*.pptx
+*.mp4
+*.avi
+*.mkv
+*.gif
+ffmpeg.exe
+user_settings.json
+config/ppt_grid_settings.json
+.vscode/
+*.log
