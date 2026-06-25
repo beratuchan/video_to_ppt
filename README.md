@@ -1,4 +1,6 @@
-# ppt_to_video — Video'dan Otomatik Slayt Üretici
+# video_to_ppt — Video'dan Otomatik Slayt Üretici
+
+> **Geliştirme aşamasında** — proje aktif olarak geliştirilmektedir, bazı özellikler eksik veya değişkenlik gösterebilir.
 
 YouTube videolarını analiz ederek sahne geçişlerini tespit eden ve her sahne için bir slayt oluşturan masaüstü uygulaması. Çıktı `.pptx` formatındadır.
 
@@ -56,7 +58,7 @@ py -3.13 main.py
 ## Proje Yapısı
 
 ```
-ppt_to_video/
+video_to_ppt/
 ├── main.py                        # Giriş noktası
 ├── config/settings.py             # Sabitler ve varsayılan değerler
 ├── domain/                        # Arayüzler (soyut katman)
